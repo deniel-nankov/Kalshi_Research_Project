@@ -12,8 +12,6 @@ wheels/
 # Virtual environments
 .venv
 .backfill_cursor
-data
-data.zip
 analysis_results
 
 research/*
