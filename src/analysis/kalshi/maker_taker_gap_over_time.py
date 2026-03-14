@@ -48,7 +48,7 @@ class MakerTakerGapOverTimeAnalysis(Analysis):
             all_positions AS (
                 SELECT
                     'taker' AS role,
-                    DATE_TRUNC('quarter', t.created_time) AS quarter,
+                    DATE_TRUNC('quarter', CAST(t.created_time AS TIMESTAMP)) AS quarter,
                     CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
                     CASE WHEN t.taker_side = m.result THEN 1.0 ELSE 0.0 END AS won,
                     t.count AS contracts
@@ -59,7 +59,7 @@ class MakerTakerGapOverTimeAnalysis(Analysis):
 
                 SELECT
                     'maker' AS role,
-                    DATE_TRUNC('quarter', t.created_time) AS quarter,
+                    DATE_TRUNC('quarter', CAST(t.created_time AS TIMESTAMP)) AS quarter,
                     CASE WHEN t.taker_side = 'yes' THEN t.no_price ELSE t.yes_price END AS price,
                     CASE WHEN t.taker_side != m.result THEN 1.0 ELSE 0.0 END AS won,
                     t.count AS contracts

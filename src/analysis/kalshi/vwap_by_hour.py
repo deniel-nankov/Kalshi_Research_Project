@@ -51,7 +51,7 @@ class VwapByHourAnalysis(Analysis):
             ),
             trade_data AS (
                 SELECT
-                    EXTRACT(HOUR FROM t.created_time) AS hour_et,
+                    EXTRACT(HOUR FROM CAST(t.created_time AS TIMESTAMP)) AS hour_et,
                     CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
                     t.count AS contracts,
                     t.count * (CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END) / 100.0 AS volume_usd

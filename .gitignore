@@ -14,6 +14,7 @@ wheels/
 .backfill_cursor
 data
 data.zip
+analysis_results
 
 research/*
 !research/main.tex

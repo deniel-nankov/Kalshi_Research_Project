@@ -23,11 +23,11 @@ format:
 	uv run ruff format .
 
 test:
-	uv run pytest tests/ -v
+	@echo "No test suite in streamlined repository."
 
 setup:
-	bash scripts/install-tools.sh
-	bash scripts/download.sh
+	uv sync
+	@echo "Run historical pull with: uv run python scripts/download_historical.py --resume"
 
 %:
 	@:

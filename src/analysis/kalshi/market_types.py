@@ -50,11 +50,11 @@ class MarketTypesAnalysis(Analysis):
             )
             SELECT
                 category,
-                SUM(volume) AS total_volume,
+                SUM(volume) AS total_contracts,
                 COUNT(*) AS market_count
             FROM categorized
             GROUP BY category
-            ORDER BY total_volume DESC
+            ORDER BY total_contracts DESC
             """
         ).df()
 
@@ -63,12 +63,12 @@ class MarketTypesAnalysis(Analysis):
         df_grouped = (
             df_raw.groupby("group")
             .agg(
-                total_volume=("total_volume", "sum"),
+                total_contracts=("total_contracts", "sum"),
                 market_count=("market_count", "sum"),
             )
             .reset_index()
         )
-        df_grouped = df_grouped.sort_values("total_volume", ascending=False)
+        df_grouped = df_grouped.sort_values("total_contracts", ascending=False)
 
         fig = self._create_figure(df_raw, df_grouped)
         chart = self._create_chart(df_raw)
@@ -79,7 +79,7 @@ class MarketTypesAnalysis(Analysis):
         """Build hierarchical JSON structure for treemap.
 
         Args:
-            df_raw: DataFrame with category and total_volume columns
+            df_raw: DataFrame with category and total_contracts columns
             min_pct: Minimum percentage of parent volume to include (default 1%)
                      Items below this threshold are excluded entirely
 
@@ -97,13 +97,13 @@ class MarketTypesAnalysis(Analysis):
         result = []
 
         # Get groups sorted by volume
-        group_totals = df_raw.groupby("group")["total_volume"].sum().sort_values(ascending=False)
+        group_totals = df_raw.groupby("group")["total_contracts"].sum().sort_values(ascending=False)
 
         for group_name, group_vol in group_totals.items():
             df_group = df_raw[df_raw["group"] == group_name]
 
             # Get mid-categories for this group
-            mid_totals = df_group.groupby("mid_category")["total_volume"].sum().sort_values(ascending=False)
+            mid_totals = df_group.groupby("mid_category")["total_contracts"].sum().sort_values(ascending=False)
 
             children = []
             for mid_name, mid_vol in mid_totals.items():
@@ -114,7 +114,7 @@ class MarketTypesAnalysis(Analysis):
                 df_mid = df_group[df_group["mid_category"] == mid_name]
 
                 # Get subcategories for this mid-category
-                sub_totals = df_mid.groupby("subcategory")["total_volume"].sum().sort_values(ascending=False)
+                sub_totals = df_mid.groupby("subcategory")["total_contracts"].sum().sort_values(ascending=False)
 
                 sub_children = []
                 for sub_name, sub_vol in sub_totals.items():
@@ -160,18 +160,18 @@ class MarketTypesAnalysis(Analysis):
         treemap_data = []
         for group_name in df_grouped["group"].tolist():
             df_group = df_raw[df_raw["group"] == group_name].copy()
-            df_group = df_group.sort_values("total_volume", ascending=False)
+            df_group = df_group.sort_values("total_contracts", ascending=False)
 
             # Take top N categories, group rest as "Other"
             if len(df_group) > top_n_per_group:
                 top_cats = df_group.head(top_n_per_group)
-                other_vol = df_group.iloc[top_n_per_group:]["total_volume"].sum()
+                other_vol = df_group.iloc[top_n_per_group:]["total_contracts"].sum()
                 for _, row in top_cats.iterrows():
                     treemap_data.append(
                         {
                             "group": group_name,
                             "category": row["category"],
-                            "volume": row["total_volume"],
+                            "volume": row["total_contracts"],
                         }
                     )
                 if other_vol > 0:
@@ -188,7 +188,7 @@ class MarketTypesAnalysis(Analysis):
                         {
                             "group": group_name,
                             "category": row["category"],
-                            "volume": row["total_volume"],
+                            "volume": row["total_contracts"],
                         }
                     )
 

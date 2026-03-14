@@ -33,8 +33,8 @@ class VolumeOverTimeAnalysis(Analysis):
         df = con.execute(
             f"""
             SELECT
-                DATE_TRUNC('quarter', created_time) AS quarter,
-                SUM(count) AS volume_usd
+                DATE_TRUNC('quarter', CAST(created_time AS TIMESTAMP)) AS quarter,
+                SUM(CAST(yes_price AS INTEGER) * CAST(count AS INTEGER) / 100.0) AS volume_usd
             FROM '{self.trades_dir}/*.parquet'
             GROUP BY quarter
             ORDER BY quarter

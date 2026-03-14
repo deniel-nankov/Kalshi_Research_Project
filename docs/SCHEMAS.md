@@ -12,21 +12,39 @@ Each row represents a prediction market contract.
 | `event_ticker` | string | Parent event identifier, used for categorization |
 | `market_type` | string | Market type (typically `binary`) |
 | `title` | string | Human-readable market title |
+| `subtitle` | string | Additional market description |
 | `yes_sub_title` | string | Label for the "Yes" outcome |
 | `no_sub_title` | string | Label for the "No" outcome |
-| `status` | string | Market status: `open`, `closed`, `finalized` |
+| `status` | string | Market status: `open`, `closed`, `active`, `finalized` |
+| `result` | string | Market outcome: `yes`, `no`, or empty if unresolved |
 | `yes_bid` | int (nullable) | Best bid price for Yes contracts (cents, 1-99) |
 | `yes_ask` | int (nullable) | Best ask price for Yes contracts (cents, 1-99) |
 | `no_bid` | int (nullable) | Best bid price for No contracts (cents, 1-99) |
 | `no_ask` | int (nullable) | Best ask price for No contracts (cents, 1-99) |
 | `last_price` | int (nullable) | Last traded price (cents, 1-99) |
+| `previous_price` | int (nullable) | Price before the last trade |
+| `previous_yes_bid` | int (nullable) | Previous best Yes bid price |
+| `previous_yes_ask` | int (nullable) | Previous best Yes ask price |
 | `volume` | int | Total contracts traded |
 | `volume_24h` | int | Contracts traded in last 24 hours |
 | `open_interest` | int | Outstanding contracts |
-| `result` | string | Market outcome: `yes`, `no`, or empty if unresolved |
+| `liquidity` | int | Current liquidity in the orderbook (cents) |
+| `tick_size` | int | Minimum price increment |
+| `strike_type` | string | Type of strike: `custom`, `date`, `number`, etc. |
+| `can_close_early` | boolean | Whether market can settle before close_time |
+| `is_provisional` | boolean | Whether settlement is provisional |
+| `rules_primary` | string | Primary settlement rules |
+| `rules_secondary` | string | Secondary settlement rules |
+| `expiration_value` | string | The value at settlement |
 | `created_time` | datetime | When the market was created |
 | `open_time` | datetime (nullable) | When trading opened |
-| `close_time` | datetime (nullable) | When trading closed |
+| `close_time` | datetime (nullable) | When trading closes |
+| `updated_time` | datetime (nullable) | When market was last updated |
+| `expected_expiration_time` | datetime (nullable) | Expected resolution time |
+| `expiration_time` | datetime (nullable) | Actual expiration time |
+| `latest_expiration_time` | datetime (nullable) | Latest possible expiration |
+| `mve_collection_ticker` | string (nullable) | Multivariate event collection identifier |
+| `mve_selected_legs` | string (nullable) | JSON string of component markets for parlays/combos |
 | `_fetched_at` | datetime | When this record was fetched |
 
 ## Kalshi Trades
@@ -40,11 +58,12 @@ Each row represents a single trade execution.
 | `count` | int | Number of contracts traded |
 | `yes_price` | int | Yes contract price (cents, 1-99) |
 | `no_price` | int | No contract price (cents, 1-99), always `100 - yes_price` |
+| `price` | float | Fractional price format (0.0-1.0 scale) |
 | `taker_side` | string | Which side the taker bought: `yes` or `no` |
 | `created_time` | datetime | When the trade occurred |
 | `_fetched_at` | datetime | When this record was fetched |
 
-**Note on Kalshi prices:** Prices are in cents. A `yes_price` of 65 means the contract costs $0.65 and pays $1.00 if the outcome is "Yes" (implied probability: 65%). The `no_price` is always `100 - yes_price`.
+**Note on Kalshi prices:** Prices are in cents. A `yes_price` of 65 means the contract costs $0.65 and pays $1.00 if the outcome is "Yes" (implied probability: 65%). The `no_price` is always `100 - yes_price`. The `price` field is the same value in fractional format (0.65).
 
 ## Polymarket Markets
 

@@ -48,7 +48,7 @@ class ReturnsByHourAnalysis(Analysis):
             ),
             trade_data AS (
                 SELECT
-                    EXTRACT(HOUR FROM t.created_time) AS hour_et,
+                    EXTRACT(HOUR FROM CAST(t.created_time AS TIMESTAMP)) AS hour_et,
                     CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
                     CASE WHEN t.taker_side = m.result THEN 1.0 ELSE 0.0 END AS won,
                     t.count AS contracts,

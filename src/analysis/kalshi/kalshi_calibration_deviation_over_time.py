@@ -86,14 +86,20 @@ class KalshiCalibrationDeviationOverTimeAnalysis(Analysis):
         min_date = df["created_time"].min()
         max_date = df["created_time"].max()
 
-        # Calculate week boundaries
-        week_dates = pd.date_range(start=min_date, end=max_date, freq="W")
+        # Calculate time boundaries (use daily for small datasets, weekly for large)
+        time_span_days = (max_date - min_date).days
+        freq = "D" if time_span_days < 7 else "W"  # Daily if < 1 week, otherwise weekly
+        time_dates = pd.date_range(start=min_date, end=max_date, freq=freq)
+        
+        # If no dates generated (same day), use the max date
+        if len(time_dates) == 0:
+            time_dates = [max_date]
 
         dates = []
         deviations = []
 
-        for end_date in week_dates:
-            # Get ALL trades from start up to this week (cumulative)
+        for end_date in time_dates:
+            # Get ALL trades from start up to this time (cumulative)
             cumulative_df = df[df["created_time"] <= end_date]
 
             # Aggregate by price across all historical trades
@@ -106,8 +112,9 @@ class KalshiCalibrationDeviationOverTimeAnalysis(Analysis):
                 .reset_index()
             )
 
-            # Skip if not enough cumulative data yet
-            if agg["total"].sum() < 1000:
+            # Skip if not enough cumulative data yet (lowered threshold for small datasets)
+            min_positions = 500 if time_span_days < 7 else 1000
+            if agg["total"].sum() < min_positions:
                 continue
 
             # Calculate cumulative win rates

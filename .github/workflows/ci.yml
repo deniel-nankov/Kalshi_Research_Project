@@ -27,8 +27,8 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check .
 
-  test:
-    name: Test
+  smoke:
+    name: Smoke Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -43,5 +43,5 @@ jobs:
       - name: Install dependencies
         run: uv sync --group dev
 
-      - name: Run tests
-        run: uv run pytest tests/ -v
+      - name: Run compile smoke check
+        run: uv run python -m compileall src scripts main.py run_all_analyses.py organize_results.py

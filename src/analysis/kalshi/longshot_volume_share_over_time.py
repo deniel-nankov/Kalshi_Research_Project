@@ -48,7 +48,7 @@ class LongshotVolumeShareOverTimeAnalysis(Analysis):
             ),
             taker_trades AS (
                 SELECT
-                    DATE_TRUNC('quarter', t.created_time) AS quarter,
+                    DATE_TRUNC('quarter', CAST(t.created_time AS TIMESTAMP)) AS quarter,
                     CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END AS price,
                     t.count AS contracts,
                     t.count * (CASE WHEN t.taker_side = 'yes' THEN t.yes_price ELSE t.no_price END) / 100.0 AS volume_usd

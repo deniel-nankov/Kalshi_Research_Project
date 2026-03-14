@@ -47,32 +47,50 @@ class StatisticalTestsAnalysis(Analysis):
 
         # Test 1: Trade Size by Role
         price_bin_df = self._test_trade_size_by_role(con)
-        n_maker_larger = price_bin_df["maker_larger"].sum()
-        n_significant = (price_bin_df["p_value"] < 0.05).sum()
+        if len(price_bin_df) > 0:
+            n_maker_larger = price_bin_df["maker_larger"].sum()
+            n_significant = (price_bin_df["p_value"] < 0.05).sum()
+            ratio = float(price_bin_df["ratio"].mean())
+        else:
+            n_maker_larger = 0
+            n_significant = 0
+            ratio = 0.0
         results["trade_size_consistency"] = {
             "bins_maker_larger": int(n_maker_larger),
             "bins_total": len(price_bin_df),
             "bins_significant_p05": int(n_significant),
-            "overall_ratio": float(price_bin_df["ratio"].mean()),
+            "overall_ratio": ratio,
         }
 
         # Test 2: YES/NO Asymmetry
         asymmetry_df = self._test_yes_no_asymmetry(con)
-        n_no_better = asymmetry_df["no_better"].sum()
-        n_significant = (asymmetry_df["p_value"] < 0.05).sum()
+        if len(asymmetry_df) > 0:
+            n_no_better = asymmetry_df["no_better"].sum()
+            n_significant = (asymmetry_df["p_value"] < 0.05).sum()
+            avg_ev_diff = float(asymmetry_df["ev_diff"].mean())
+        else:
+            n_no_better = 0
+            n_significant = 0
+            avg_ev_diff = 0.0
         results["yes_no_asymmetry"] = {
             "prices_no_better": int(n_no_better),
             "prices_total": len(asymmetry_df),
             "prices_significant": int(n_significant),
-            "avg_ev_diff": float(asymmetry_df["ev_diff"].mean()),
+            "avg_ev_diff": avg_ev_diff,
         }
 
         # Test 3: Category Comparisons
         pairwise_df = self._test_category_gaps(con)
+        if len(pairwise_df) > 0:
+            n_sig = int((pairwise_df["p_value"] < 0.05).sum())
+            max_d = float(pairwise_df["cohens_d"].abs().max())
+        else:
+            n_sig = 0
+            max_d = 0.0
         results["category_comparisons"] = {
-            "all_significant_vs_finance": int((pairwise_df["p_value"] < 0.05).sum()),
+            "all_significant_vs_finance": n_sig,
             "total_comparisons": len(pairwise_df),
-            "max_cohens_d": float(pairwise_df["cohens_d"].abs().max()),
+            "max_cohens_d": max_d,
         }
 
         # Test 4: Trade Size -> Performance
@@ -81,8 +99,12 @@ class StatisticalTestsAnalysis(Analysis):
 
         # Test 5: Maker Direction
         direction_df = self._test_maker_direction(con)
-        n_no_better = direction_df["no_better"].sum()
-        n_significant = (direction_df["p_value"] < 0.05).sum()
+        if len(direction_df) > 0:
+            n_no_better = direction_df["no_better"].sum()
+            n_significant = (direction_df["p_value"] < 0.05).sum()
+        else:
+            n_no_better = 0
+            n_significant = 0
         results["maker_direction"] = {
             "ranges_no_better": int(n_no_better),
             "ranges_total": len(direction_df),

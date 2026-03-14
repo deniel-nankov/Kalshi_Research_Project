@@ -35,15 +35,17 @@ class MetaStatsAnalysis(Analysis):
             f"""
             SELECT
                 COUNT(*) AS num_trades,
-                SUM(count) AS total_volume,
+                SUM(CAST(count AS INTEGER)) AS total_contracts,
+                SUM(CAST(yes_price AS INTEGER) * CAST(count AS INTEGER) / 100.0) AS total_volume_usd,
                 COUNT(DISTINCT ticker) AS num_tickers
             FROM '{self.trades_dir}/*.parquet'
             """
         ).fetchone()
 
         num_trades = trade_stats[0]
-        total_volume = trade_stats[1]
-        num_tickers_from_trades = trade_stats[2]
+        total_contracts = trade_stats[1]
+        total_volume_usd = trade_stats[2]
+        num_tickers_from_trades = trade_stats[3]
 
         # Market statistics
         market_stats = con.execute(
@@ -67,19 +69,19 @@ class MetaStatsAnalysis(Analysis):
                     "formatted": self._format_number(num_trades),
                 },
                 {
-                    "metric": "num_trades_millions",
-                    "value": num_trades / 1e6,
-                    "formatted": self._format_millions(num_trades),
+                    "metric": "total_contracts",
+                    "value": total_contracts,
+                    "formatted": self._format_number(int(total_contracts)),
                 },
                 {
-                    "metric": "total_volume",
-                    "value": total_volume,
-                    "formatted": self._format_number(int(total_volume)),
+                    "metric": "total_volume_usd",
+                    "value": total_volume_usd,
+                    "formatted": f"${total_volume_usd:,.2f}",
                 },
                 {
-                    "metric": "total_volume_billions",
-                    "value": total_volume / 1e9,
-                    "formatted": self._format_billions(total_volume),
+                    "metric": "avg_position_size",
+                    "value": total_contracts / num_trades if num_trades > 0 else 0,
+                    "formatted": f"{total_contracts / num_trades:.1f}" if num_trades > 0 else "0",
                 },
                 {
                     "metric": "num_markets",
@@ -92,9 +94,14 @@ class MetaStatsAnalysis(Analysis):
                     "formatted": self._format_number(num_events),
                 },
                 {
-                    "metric": "num_tickers_from_trades",
+                    "metric": "num_tickers_with_trades",
                     "value": num_tickers_from_trades,
                     "formatted": self._format_number(num_tickers_from_trades),
+                },
+                {
+                    "metric": "markets_with_trades_pct",
+                    "value": 100.0 * num_tickers_from_trades / num_markets if num_markets > 0 else 0,
+                    "formatted": f"{100.0 * num_tickers_from_trades / num_markets:.1f}%" if num_markets > 0 else "0%",
                 },
             ]
         )
