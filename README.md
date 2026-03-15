@@ -86,6 +86,33 @@ This downloads the full historical snapshot from Kalshi production endpoints int
 - `data/kalshi/historical/trades/batch_*.parquet`
 - `data/kalshi/historical/.checkpoint.json`
 
+#### 1.5️⃣ Keep Forward Ingestion Running (Incremental)
+
+After the full historical backfill, append only new data with:
+
+```bash
+uv run python scripts/update_forward.py
+```
+
+Safe testing mode (no writes):
+
+```bash
+uv run python scripts/update_forward.py --dry-run
+```
+
+Incremental outputs:
+
+- `data/kalshi/incremental/trades/dt=*/trades_*.parquet`
+- `data/kalshi/incremental/markets/dt=*/markets_*.parquet`
+- `data/kalshi/state/forward_checkpoint.json`
+- `data/kalshi/state/runs/*.json`
+
+One-command validation (boundary + duplicate checks):
+
+```bash
+uv run python scripts/validate_forward_pipeline.py --strict
+```
+
 #### 2️⃣ Run All Analyses
 
 ```bash
