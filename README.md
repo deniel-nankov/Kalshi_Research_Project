@@ -88,11 +88,13 @@ This downloads the full historical snapshot from Kalshi production endpoints int
 
 #### 1.5️⃣ Keep Forward Ingestion Running (Incremental)
 
-After the full historical backfill, append only new data with:
+After the full historical backfill, pull new data from Kalshi and append to the dataset:
 
 ```bash
 uv run python scripts/update_forward.py
 ```
+
+All Kalshi data lives in one place under `data/kalshi/historical/`: historical batches plus forward-appended files.
 
 Safe testing mode (no writes):
 
@@ -100,10 +102,10 @@ Safe testing mode (no writes):
 uv run python scripts/update_forward.py --dry-run
 ```
 
-Incremental outputs:
+Forward (incremental) outputs — stored under the same tree as historical:
 
-- `data/kalshi/incremental/trades/dt=*/trades_*.parquet`
-- `data/kalshi/incremental/markets/dt=*/markets_*.parquet`
+- `data/kalshi/historical/forward_trades/dt=*/trades_*.parquet`
+- `data/kalshi/historical/forward_markets/dt=*/markets_*.parquet`
 - `data/kalshi/state/forward_checkpoint.json`
 - `data/kalshi/state/runs/*.json`
 

@@ -424,13 +424,24 @@ def _write_markets_parquet(rows: list[dict]):
 # Phase 2 — Download trades for every market
 # ──────────────────────────────────────────────────────────────────────
 
+def _parse_count(t: dict) -> int:
+    """Use count_fp as the source of truth for contract size (API populates it for 100% of trades; when count is also set they match). Fall back to count if count_fp is missing."""
+    cfp = t.get("count_fp") or ""
+    if cfp:
+        try:
+            return int(float(cfp))
+        except (TypeError, ValueError):
+            pass
+    return int(t.get("count", 0) or 0)
+
+
 def _trade_row(t: dict) -> dict:
     """Extract a flat row from a raw trade JSON object."""
     return {
         "trade_id": t.get("trade_id", ""),
         "ticker": t.get("ticker", ""),
         "taker_side": t.get("taker_side", ""),
-        "count": int(t.get("count", 0) or 0),
+        "count": _parse_count(t),
         "yes_price": int(t.get("yes_price", 0) or 0),
         "no_price": int(t.get("no_price", 0) or 0),
         "price": float(t.get("price", 0) or 0),

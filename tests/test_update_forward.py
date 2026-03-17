@@ -24,20 +24,20 @@ def load_update_forward_module():
 
 
 def patch_paths(module, tmp_path: Path):
-    module.ROOT_DIR = tmp_path / "data" / "kalshi"
-    module.INCREMENTAL_DIR = module.ROOT_DIR / "incremental"
-    module.INCREMENTAL_TRADES_DIR = module.INCREMENTAL_DIR / "trades"
-    module.INCREMENTAL_MARKETS_DIR = module.INCREMENTAL_DIR / "markets"
-    module.STATE_DIR = module.ROOT_DIR / "state"
-    module.CHECKPOINT_FILE = module.STATE_DIR / "forward_checkpoint.json"
-    module.RUN_MANIFEST_DIR = module.STATE_DIR / "runs"
-    module.LOCK_FILE = module.STATE_DIR / "forward_ingestion.lock"
-
-    module.HISTORICAL_CHECKPOINT_FILE = module.ROOT_DIR / "historical" / ".checkpoint.json"
-    module.HISTORICAL_TRADES_GLOB = module.ROOT_DIR / "historical" / "trades" / "*.parquet"
-    module.HISTORICAL_MARKETS_FILE = module.ROOT_DIR / "historical" / "markets.parquet"
-    module.LEGACY_TRADES_GLOB = module.ROOT_DIR / "trades" / "*.parquet"
-    module.LEGACY_MARKETS_GLOB = module.ROOT_DIR / "markets" / "*.parquet"
+    root = tmp_path / "data" / "kalshi"
+    hist = root / "historical"
+    module.CHECKPOINT_FILE = root / "state" / "forward_checkpoint.json"
+    module.RUN_MANIFEST_DIR = root / "state" / "runs"
+    module.LOCK_FILE = root / "state" / "forward_ingestion.lock"
+    module.FORWARD_TRADES_DIR = hist / "forward_trades"
+    module.FORWARD_MARKETS_DIR = hist / "forward_markets"
+    module.FORWARD_TRADES_GLOB = module.FORWARD_TRADES_DIR / "*" / "*.parquet"
+    module.FORWARD_MARKETS_GLOB = module.FORWARD_MARKETS_DIR / "*" / "*.parquet"
+    module.HISTORICAL_CHECKPOINT_FILE = hist / ".checkpoint.json"
+    module.HISTORICAL_TRADES_GLOB = hist / "trades" / "*.parquet"
+    module.HISTORICAL_MARKETS_FILE = hist / "markets.parquet"
+    module.LEGACY_TRADES_GLOB = root / "trades" / "*.parquet"
+    module.LEGACY_MARKETS_GLOB = root / "markets" / "*.parquet"
 
 
 def base_args(**overrides):
@@ -134,9 +134,10 @@ def test_dry_run_does_not_persist_checkpoint_or_parquet(tmp_path, monkeypatch):
     module.run(base_args(dry_run=True))
 
     assert not module.CHECKPOINT_FILE.exists()
-    assert not list(module.INCREMENTAL_TRADES_DIR.rglob("*.parquet"))
-    assert not list(module.INCREMENTAL_MARKETS_DIR.rglob("*.parquet"))
-    assert len(list(module.RUN_MANIFEST_DIR.glob("*.json"))) == 1
+    assert not list(module.FORWARD_TRADES_DIR.rglob("*.parquet"))
+    assert not list(module.FORWARD_MARKETS_DIR.rglob("*.parquet"))
+    # Dry run must not write run manifest
+    assert not module.RUN_MANIFEST_DIR.exists() or len(list(module.RUN_MANIFEST_DIR.glob("*.json"))) == 0
 
 
 def test_run_writes_deduped_rows_and_advances_checkpoint(tmp_path, monkeypatch):
@@ -174,8 +175,8 @@ def test_run_writes_deduped_rows_and_advances_checkpoint(tmp_path, monkeypatch):
     assert checkpoint["total_trade_rows_written"] == 2
     assert checkpoint["total_market_rows_written"] == 1
 
-    trade_files = list(module.INCREMENTAL_TRADES_DIR.rglob("*.parquet"))
-    market_files = list(module.INCREMENTAL_MARKETS_DIR.rglob("*.parquet"))
+    trade_files = list(module.FORWARD_TRADES_DIR.rglob("*.parquet"))
+    market_files = list(module.FORWARD_MARKETS_DIR.rglob("*.parquet"))
     assert len(trade_files) == 1
     assert len(market_files) == 1
 
@@ -208,16 +209,16 @@ def test_second_run_is_idempotent_with_existing_incremental_files(tmp_path, monk
     # Second run sees existing incremental trade_id and writes nothing new.
     module.run(base_args(dry_run=False, lookback_seconds=0))
 
-    trade_files = list(module.INCREMENTAL_TRADES_DIR.rglob("*.parquet"))
+    trade_files = list(module.FORWARD_TRADES_DIR.rglob("*.parquet"))
     assert len(trade_files) == 1
 
     con = duckdb.connect()
     try:
         total_count = con.execute(
-            f"SELECT COUNT(*) FROM '{module.INCREMENTAL_TRADES_DIR}/**/*.parquet'"
+            f"SELECT COUNT(*) FROM '{module.FORWARD_TRADES_DIR}/**/*.parquet'"
         ).fetchone()[0]
         distinct_count = con.execute(
-            f"SELECT COUNT(DISTINCT trade_id) FROM '{module.INCREMENTAL_TRADES_DIR}/**/*.parquet'"
+            f"SELECT COUNT(DISTINCT trade_id) FROM '{module.FORWARD_TRADES_DIR}/**/*.parquet'"
         ).fetchone()[0]
     finally:
         con.close()
@@ -268,5 +269,5 @@ def test_noop_when_upper_bound_not_ahead(tmp_path, monkeypatch):
     # No fetch should happen because there is no new processing window.
     assert called["trade"] is False
     assert called["market"] is False
-    assert not list(module.INCREMENTAL_TRADES_DIR.rglob("*.parquet"))
-    assert not list(module.INCREMENTAL_MARKETS_DIR.rglob("*.parquet"))
+    assert not list(module.FORWARD_TRADES_DIR.rglob("*.parquet"))
+    assert not list(module.FORWARD_MARKETS_DIR.rglob("*.parquet"))

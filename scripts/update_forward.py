@@ -23,17 +23,23 @@ Examples:
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure project root on path when run as script
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_ROOT))
+
 import argparse
 import json
 import logging
 import os
 import signal
-import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import duckdb
@@ -42,31 +48,34 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Config
+# Config (paths from shared module; single place under data/kalshi/historical)
 # ──────────────────────────────────────────────────────────────────────────────
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-MARKETS_PATH = "/historical/markets"
-MARKET_TRADES_PATH = "/markets/trades"
-HISTORICAL_CUTOFF_PATH = "/historical/cutoff"
-
-ROOT_DIR = Path("data/kalshi")
-INCREMENTAL_DIR = ROOT_DIR / "incremental"
-INCREMENTAL_TRADES_DIR = INCREMENTAL_DIR / "trades"
-INCREMENTAL_MARKETS_DIR = INCREMENTAL_DIR / "markets"
-STATE_DIR = ROOT_DIR / "state"
-CHECKPOINT_FILE = STATE_DIR / "forward_checkpoint.json"
-RUN_MANIFEST_DIR = STATE_DIR / "runs"
-LOCK_FILE = STATE_DIR / "forward_ingestion.lock"
-
-HISTORICAL_CHECKPOINT_FILE = ROOT_DIR / "historical" / ".checkpoint.json"
-HISTORICAL_TRADES_GLOB = ROOT_DIR / "historical" / "trades" / "*.parquet"
-HISTORICAL_MARKETS_FILE = ROOT_DIR / "historical" / "markets.parquet"
-LEGACY_TRADES_GLOB = ROOT_DIR / "trades" / "*.parquet"
-LEGACY_MARKETS_GLOB = ROOT_DIR / "markets" / "*.parquet"
+from src.kalshi_forward.paths import (
+    BASE_URL,
+    CHECKPOINT_FILE,
+    FORWARD_MARKETS_DIR,
+    FORWARD_MARKETS_GLOB,
+    FORWARD_TRADES_DIR,
+    FORWARD_TRADES_GLOB,
+    HISTORICAL_CHECKPOINT_FILE,
+    HISTORICAL_CUTOFF_PATH,
+    HISTORICAL_MARKETS_FILE,
+    HISTORICAL_TRADES_GLOB,
+    LEGACY_FORWARD_MARKETS_GLOB,
+    LEGACY_FORWARD_TRADES_GLOB,
+    LEGACY_MARKETS_GLOB,
+    LEGACY_TRADES_GLOB,
+    LOCK_FILE,
+    MARKET_TRADES_PATH,
+    MARKETS_PATH,
+    RUN_MANIFEST_DIR,
+    STATE_DIR,
+)
 
 TRADE_PAGE_LIMIT = 1000
 MARKET_PAGE_LIMIT = 1000
 DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
+MARKET_LOOKBACK_DAYS = 7  # Widen market fetch backwards so trades have matching markets (reduce orphans)
 MAX_RETRIES = 6
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 120.0
@@ -433,12 +442,23 @@ def market_row_from_api(m: dict, run_id: str, ingested_at: str) -> dict:
     }
 
 
+def _parse_count(t: dict) -> int:
+    """Use count_fp as the source of truth for contract size (API populates it for 100% of trades; when count is also set they match). Fall back to count if count_fp is missing."""
+    cfp = t.get("count_fp") or ""
+    if cfp:
+        try:
+            return int(float(cfp))
+        except (TypeError, ValueError):
+            pass
+    return int(t.get("count", 0) or 0)
+
+
 def trade_row_from_api(t: dict, run_id: str, ingested_at: str) -> dict:
     return {
         "trade_id": t.get("trade_id", ""),
         "ticker": t.get("ticker", ""),
         "taker_side": t.get("taker_side", ""),
-        "count": int(t.get("count", 0) or 0),
+        "count": _parse_count(t),
         "yes_price": int(t.get("yes_price", 0) or 0),
         "no_price": int(t.get("no_price", 0) or 0),
         "price": float(t.get("price", 0) or 0),
@@ -461,8 +481,10 @@ def _existing_trade_id_sources() -> list[str]:
         patterns.append(str(HISTORICAL_TRADES_GLOB))
     if safe_glob_exists(LEGACY_TRADES_GLOB):
         patterns.append(str(LEGACY_TRADES_GLOB))
-    if INCREMENTAL_TRADES_DIR.exists() and any(INCREMENTAL_TRADES_DIR.rglob("*.parquet")):
-        patterns.append(str(INCREMENTAL_TRADES_DIR / "*" / "*.parquet"))
+    if FORWARD_TRADES_DIR.exists() and any(FORWARD_TRADES_DIR.rglob("*.parquet")):
+        patterns.append(str(FORWARD_TRADES_GLOB))
+    if safe_glob_exists(LEGACY_FORWARD_TRADES_GLOB):
+        patterns.append(str(LEGACY_FORWARD_TRADES_GLOB))
     return patterns
 
 
@@ -472,8 +494,10 @@ def _existing_market_key_sources() -> list[str]:
         patterns.append(str(HISTORICAL_MARKETS_FILE))
     if safe_glob_exists(LEGACY_MARKETS_GLOB):
         patterns.append(str(LEGACY_MARKETS_GLOB))
-    if INCREMENTAL_MARKETS_DIR.exists() and any(INCREMENTAL_MARKETS_DIR.rglob("*.parquet")):
-        patterns.append(str(INCREMENTAL_MARKETS_DIR / "*" / "*.parquet"))
+    if FORWARD_MARKETS_DIR.exists() and any(FORWARD_MARKETS_DIR.rglob("*.parquet")):
+        patterns.append(str(FORWARD_MARKETS_GLOB))
+    if safe_glob_exists(LEGACY_FORWARD_MARKETS_GLOB):
+        patterns.append(str(LEGACY_FORWARD_MARKETS_GLOB))
     return patterns
 
 
@@ -617,6 +641,7 @@ def fetch_market_deltas(
 ) -> list[dict]:
     ingested_at = iso_now()
     rows: list[dict] = []
+    seen_key_in_fetch: set[str] = set()  # Prevent same (ticker, close_time) from API appearing twice in one run
     cursor: Optional[str] = None
 
     page = 0
@@ -629,9 +654,10 @@ def fetch_market_deltas(
         params: dict[str, Any] = {"limit": MARKET_PAGE_LIMIT}
         if cursor:
             params["cursor"] = cursor
-        # Server-side windowing greatly reduces scan volume for historical catch-up.
-        # /historical/markets supports close-time filters.
-        params["min_close_ts"] = max(min_ts_exclusive + 1, 0)
+        # Widen market window backwards so we pull markets that closed before the trade window
+        # (reduces orphan tickers: trades can reference markets that closed slightly earlier).
+        market_lookback = MARKET_LOOKBACK_DAYS * 24 * 60 * 60
+        params["min_close_ts"] = max(min_ts_exclusive + 1 - market_lookback, 0)
         params["max_close_ts"] = max_ts_inclusive
 
         data = client.get(MARKETS_PATH, params=params)
@@ -649,6 +675,10 @@ def fetch_market_deltas(
                 continue
             if effective_ts > max_ts_inclusive:
                 continue
+            key = market_key(row)
+            if key in seen_key_in_fetch:
+                continue
+            seen_key_in_fetch.add(key)
             rows.append(row)
 
         if page % 25 == 0:
@@ -714,7 +744,10 @@ def run(args: argparse.Namespace):
 
     client = RobustClient()
     try:
-        upper_bound_ts, upper_meta = get_upper_bound_ts(client, historical_only=args.historical_only)
+        base_upper_ts, upper_meta = get_upper_bound_ts(client, historical_only=args.historical_only)
+        upper_bound_ts = min(base_upper_ts, args.end_ts) if args.end_ts is not None else base_upper_ts
+        if args.end_ts is not None:
+            log.info(f"Upper bound capped by --end-ts: {args.end_ts} ({iso_from_epoch(args.end_ts)})")
         log.info(f"Upper bound mode:          {'historical cutoff' if args.historical_only else 'live now'}")
         log.info(f"Upper bound ts:            {upper_bound_ts} ({iso_from_epoch(upper_bound_ts)})")
 
@@ -764,7 +797,7 @@ def run(args: argparse.Namespace):
             trade_seen.add(trade_id)
             trade_rows.append(row)
 
-        # Dedupe markets
+        # Dedupe markets (within batch and vs existing) so we never write duplicate (ticker, close_time)
         market_seen: set[str] = set()
         market_rows: list[dict] = []
         skipped_market_dupes = 0
@@ -790,11 +823,11 @@ def run(args: argparse.Namespace):
 
         if not args.dry_run:
             if trade_rows:
-                written_trade_path = INCREMENTAL_TRADES_DIR / f"dt={run_date}" / f"trades_{run_id}.parquet"
+                written_trade_path = FORWARD_TRADES_DIR / f"dt={run_date}" / f"trades_{run_id}.parquet"
                 atomic_write_parquet(written_trade_path, trade_rows, schema=TRADE_SCHEMA)
 
             if market_rows:
-                written_market_path = INCREMENTAL_MARKETS_DIR / f"dt={run_date}" / f"markets_{run_id}.parquet"
+                written_market_path = FORWARD_MARKETS_DIR / f"dt={run_date}" / f"markets_{run_id}.parquet"
                 atomic_write_parquet(written_market_path, market_rows, schema=MARKET_SCHEMA)
 
             # Advance checkpoint only after successful writes
@@ -807,42 +840,43 @@ def run(args: argparse.Namespace):
             cp.total_market_rows_written += len(market_rows)
             cp.save()
 
-        run_manifest = {
-            "run_id": run_id,
-            "started_at": run_started_at,
-            "completed_at": iso_now(),
-            "dry_run": args.dry_run,
-            "historical_only": args.historical_only,
-            "lookback_seconds": args.lookback_seconds,
-            "upper_bound": {
-                "ts": upper_bound_ts,
-                "iso": iso_from_epoch(upper_bound_ts),
-                "meta": upper_meta,
-            },
-            "windows": {
-                "trade": {"min_exclusive": min_trade_ts, "max_inclusive": upper_bound_ts},
-                "market": {"min_exclusive": min_market_ts, "max_inclusive": upper_bound_ts},
-            },
-            "counts": {
-                "trade_raw": len(raw_trade_rows),
-                "trade_written": len(trade_rows),
-                "trade_skipped_dupes": skipped_trade_dupes,
-                "market_raw": len(raw_market_rows),
-                "market_written": len(market_rows),
-                "market_skipped_dupes": skipped_market_dupes,
-            },
-            "outputs": {
-                "trades_file": str(written_trade_path) if written_trade_path else "",
-                "markets_file": str(written_market_path) if written_market_path else "",
-            },
-            "client_stats": {
-                "requests": client.request_count,
-                "errors": client.error_count,
-                "rate_limited": client.rate_limit_count,
-            },
-        }
-        RUN_MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(RUN_MANIFEST_DIR / f"{run_id}.json", run_manifest)
+        if not args.dry_run:
+            run_manifest = {
+                "run_id": run_id,
+                "started_at": run_started_at,
+                "completed_at": iso_now(),
+                "dry_run": args.dry_run,
+                "historical_only": args.historical_only,
+                "lookback_seconds": args.lookback_seconds,
+                "upper_bound": {
+                    "ts": upper_bound_ts,
+                    "iso": iso_from_epoch(upper_bound_ts),
+                    "meta": upper_meta,
+                },
+                "windows": {
+                    "trade": {"min_exclusive": min_trade_ts, "max_inclusive": upper_bound_ts},
+                    "market": {"min_exclusive": min_market_ts, "max_inclusive": upper_bound_ts},
+                },
+                "counts": {
+                    "trade_raw": len(raw_trade_rows),
+                    "trade_written": len(trade_rows),
+                    "trade_skipped_dupes": skipped_trade_dupes,
+                    "market_raw": len(raw_market_rows),
+                    "market_written": len(market_rows),
+                    "market_skipped_dupes": skipped_market_dupes,
+                },
+                "outputs": {
+                    "trades_file": str(written_trade_path) if written_trade_path else "",
+                    "markets_file": str(written_market_path) if written_market_path else "",
+                },
+                "client_stats": {
+                    "requests": client.request_count,
+                    "errors": client.error_count,
+                    "rate_limited": client.rate_limit_count,
+                },
+            }
+            RUN_MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(RUN_MANIFEST_DIR / f"{run_id}.json", run_manifest)
 
         if args.dry_run:
             log.info("Dry run complete. No files or checkpoint were modified.")
@@ -882,6 +916,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Explicit bootstrap UNIX timestamp (used only when checkpoint is missing)",
+    )
+    parser.add_argument(
+        "--end-ts",
+        type=int,
+        default=None,
+        help="Cap upper bound to this UNIX timestamp (for backfilling a gap; e.g. first forward trade time)",
     )
     parser.add_argument(
         "--max-trade-pages",

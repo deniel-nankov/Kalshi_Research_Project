@@ -55,13 +55,15 @@ Each row represents a single trade execution.
 |--------|------|-------------|
 | `trade_id` | string | Unique trade identifier |
 | `ticker` | string | Market ticker this trade belongs to |
-| `count` | int | Number of contracts traded |
+| `count` | int | Number of contracts traded (ingestion uses **count_fp** as source of truth when present; fallback to API `count`) |
 | `yes_price` | int | Yes contract price (cents, 1-99) |
 | `no_price` | int | No contract price (cents, 1-99), always `100 - yes_price` |
 | `price` | float | Fractional price format (0.0-1.0 scale) |
 | `taker_side` | string | Which side the taker bought: `yes` or `no` |
 | `created_time` | datetime | When the trade occurred |
 | `_fetched_at` | datetime | When this record was fetched |
+
+**Note on contract count:** The API often sends `count` = 0 and the size in `count_fp` (string, e.g. `"46.00"`). We store both; the `count` column is filled from `count_fp` when present so analytics can use `count` for contract size. When both are sent they match.
 
 **Note on Kalshi prices:** Prices are in cents. A `yes_price` of 65 means the contract costs $0.65 and pays $1.00 if the outcome is "Yes" (implied probability: 65%). The `no_price` is always `100 - yes_price`. The `price` field is the same value in fractional format (0.65).
 

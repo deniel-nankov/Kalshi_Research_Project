@@ -1,31 +1,49 @@
 #!/usr/bin/env python3
 """
-Run forward catch-up ingestion with live terminal monitoring.
+Run forward ingestion with live terminal monitoring.
 
-This wrapper executes scripts/update_forward.py and prints:
+Pulls data from Kalshi and appends to the dataset (after historical is available).
+This wrapper runs scripts/update_forward.py and prints:
   • real-time ingestion logs from the child process
   • periodic checkpoint snapshot (watermarks, totals)
-  • periodic file snapshot (incremental files + size)
+  • periodic file snapshot (forward files under data/kalshi/historical/ + size)
 
-Example:
+Defaults to live mode (upper bound = now). Use --historical-only for catch-up
+to the API historical cutoff only.
+
+Examples:
+  uv run python scripts/run_forward_with_live_monitor.py
   uv run python scripts/run_forward_with_live_monitor.py --historical-only
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure project root on path when run as script (e.g. uv run python scripts/...)
+_SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_ROOT))
+
 import argparse
 import json
 import signal
 import subprocess
-import sys
 import time
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-STATE_CHECKPOINT = ROOT / "data" / "kalshi" / "state" / "forward_checkpoint.json"
-INCR_TRADES_DIR = ROOT / "data" / "kalshi" / "incremental" / "trades"
-INCR_MARKETS_DIR = ROOT / "data" / "kalshi" / "incremental" / "markets"
-RUNS_DIR = ROOT / "data" / "kalshi" / "state" / "runs"
+try:
+    import select
+except ImportError:
+    select = None  # Windows: no select on pipes; fall back to line-based snapshot
+
+from src.kalshi_forward.paths import (
+    CHECKPOINT_FILE,
+    FORWARD_MARKETS_DIR,
+    FORWARD_TRADES_DIR,
+    PROJECT_ROOT,
+    RUN_MANIFEST_DIR,
+)
 
 
 def human_bytes(n: int) -> str:
@@ -39,10 +57,10 @@ def human_bytes(n: int) -> str:
 
 
 def snapshot_checkpoint() -> str:
-    if not STATE_CHECKPOINT.exists():
+    if not CHECKPOINT_FILE.exists():
         return "checkpoint: (missing yet)"
     try:
-        data = json.loads(STATE_CHECKPOINT.read_text())
+        data = json.loads(CHECKPOINT_FILE.read_text())
         return (
             "checkpoint: "
             f"trade_wm={data.get('watermark_trade_ts')} "
@@ -55,8 +73,8 @@ def snapshot_checkpoint() -> str:
 
 
 def snapshot_files() -> str:
-    trade_files = list(INCR_TRADES_DIR.rglob("*.parquet")) if INCR_TRADES_DIR.exists() else []
-    market_files = list(INCR_MARKETS_DIR.rglob("*.parquet")) if INCR_MARKETS_DIR.exists() else []
+    trade_files = list(FORWARD_TRADES_DIR.rglob("*.parquet")) if FORWARD_TRADES_DIR.exists() else []
+    market_files = list(FORWARD_MARKETS_DIR.rglob("*.parquet")) if FORWARD_MARKETS_DIR.exists() else []
 
     total_bytes = 0
     for path in trade_files + market_files:
@@ -65,7 +83,7 @@ def snapshot_files() -> str:
         except OSError:
             pass
 
-    runs = len(list(RUNS_DIR.glob("*.json"))) if RUNS_DIR.exists() else 0
+    runs = len(list(RUN_MANIFEST_DIR.glob("*.json"))) if RUN_MANIFEST_DIR.exists() else 0
     return (
         "files: "
         f"trade_files={len(trade_files)} "
@@ -76,7 +94,7 @@ def snapshot_files() -> str:
 
 
 def build_cmd(args: argparse.Namespace) -> list[str]:
-    cmd = [sys.executable, str(ROOT / "scripts" / "update_forward.py")]
+    cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "update_forward.py")]
     if args.historical_only:
         cmd.append("--historical-only")
     if args.lookback_seconds is not None:
@@ -87,22 +105,95 @@ def build_cmd(args: argparse.Namespace) -> list[str]:
         cmd.extend(["--max-market-pages", str(args.max_market_pages)])
     if args.dry_run:
         cmd.append("--dry-run")
+    if getattr(args, "bootstrap_from_historical", None) is True:
+        cmd.append("--bootstrap-from-historical")
+    if args.start_ts is not None:
+        cmd.extend(["--start-ts", str(args.start_ts)])
     return cmd
+
+
+def _read_with_snapshot_interval(proc: subprocess.Popen, monitor_interval: float) -> int:
+    """Read child stdout; print periodic snapshots on interval (Unix). On Windows, snapshots when lines arrive."""
+    assert proc.stdout is not None
+    start = time.time()
+    next_snapshot = start
+    read_timeout = 1.0
+
+    while True:
+        if select is not None:
+            try:
+                ready, _, _ = select.select([proc.stdout], [], [], read_timeout)
+            except (ValueError, OSError):
+                ready = []
+            now = time.time()
+            if now >= next_snapshot:
+                elapsed = now - start
+                print(
+                    "[monitor]",
+                    f"elapsed={elapsed:.1f}s",
+                    "|",
+                    snapshot_checkpoint(),
+                    "|",
+                    snapshot_files(),
+                    flush=True,
+                )
+                next_snapshot = now + monitor_interval
+            if proc.poll() is not None:
+                remainder = proc.stdout.read()
+                if remainder:
+                    print(remainder.rstrip(), flush=True)
+                break
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    print(line.rstrip(), flush=True)
+        else:
+            # Windows: no select on pipes; snapshot only when we get a line
+            line = proc.stdout.readline()
+            if line:
+                print(line.rstrip(), flush=True)
+            now = time.time()
+            if now >= next_snapshot:
+                elapsed = now - start
+                print(
+                    "[monitor]",
+                    f"elapsed={elapsed:.1f}s",
+                    "|",
+                    snapshot_checkpoint(),
+                    "|",
+                    snapshot_files(),
+                    flush=True,
+                )
+                next_snapshot = now + monitor_interval
+            if proc.poll() is not None:
+                remainder = proc.stdout.read()
+                if remainder:
+                    print(remainder.rstrip(), flush=True)
+                break
+
+    return proc.returncode or 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run update_forward.py with live monitoring")
-    parser.add_argument("--historical-only", action="store_true", default=True)
+    parser.add_argument(
+        "--historical-only",
+        action="store_true",
+        default=False,
+        help="Use API historical cutoff as upper bound (default: False = live now)",
+    )
     parser.add_argument("--lookback-seconds", type=int, default=None)
     parser.add_argument("--max-trade-pages", type=int, default=None)
     parser.add_argument("--max-market-pages", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--bootstrap-from-historical", action="store_true", help="Bootstrap checkpoint from historical cutoff when missing")
+    parser.add_argument("--start-ts", type=int, default=None, help="Bootstrap start timestamp when checkpoint missing")
     parser.add_argument("--monitor-interval", type=float, default=5.0)
     args = parser.parse_args()
 
     cmd = build_cmd(args)
     print("=" * 88)
-    print("FORWARD CATCH-UP LIVE MONITOR")
+    print("FORWARD INGESTION LIVE MONITOR")
     print("=" * 88)
     print("command:", " ".join(cmd))
     print("monitor interval:", f"{args.monitor_interval:.1f}s")
@@ -110,7 +201,7 @@ def main() -> int:
 
     proc = subprocess.Popen(
         cmd,
-        cwd=ROOT,
+        cwd=PROJECT_ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -126,29 +217,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _forward_signal)
     signal.signal(signal.SIGTERM, _forward_signal)
 
-    assert proc.stdout is not None
-    start = time.time()
-    next_snapshot = start
+    rc = _read_with_snapshot_interval(proc, args.monitor_interval)
 
-    while True:
-        line = proc.stdout.readline()
-        if line:
-            print(line.rstrip())
-
-        now = time.time()
-        if now >= next_snapshot:
-            elapsed = now - start
-            print("[monitor]", f"elapsed={elapsed:.1f}s", "|", snapshot_checkpoint(), "|", snapshot_files())
-            next_snapshot = now + args.monitor_interval
-
-        if proc.poll() is not None:
-            # flush any remaining output
-            remainder = proc.stdout.read()
-            if remainder:
-                print(remainder.rstrip())
-            break
-
-    rc = proc.returncode
     print("-" * 88)
     print("[monitor] done", f"exit_code={rc}")
     print("[monitor]", snapshot_checkpoint())
