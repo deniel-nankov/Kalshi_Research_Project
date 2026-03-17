@@ -142,3 +142,12 @@ Existing forward data is deduped by `trade_id`, so you won’t duplicate rows.
 
 **7. Re-run the health report**  
 BOUNDARY_GAP should PASS (gap ≤ 24h). BOUNDARY_ALIGNMENT is independent; if the API still returns 403, that check will still show “Skipped (API unreachable: 403 …)” and does not affect the backfill.
+
+---
+
+## Technical notes (sources and prevention)
+
+- **Duplicate market keys:** Can come from the same market returned on multiple API pages or in overlapping forward runs. We dedupe *within* each fetch (`seen_key_in_fetch`) and *at write* against existing keys, so new runs do not add duplicates. One-time cleanup: `fix_forward_markets_dedupe.py` (or `dedupe_forward_markets_once.py` for a single deduped file).
+- **Orphan tickers:** Caused by trade vs market time windows (e.g. trade in window, market's `close_time` outside the market fetch window). We use `MARKET_LOOKBACK_DAYS = 7` so markets that closed up to 7 days before the trade window are still fetched, which reduces new orphans.
+- **count = 0:** The API often sends contract size in `count_fp` (string) and leaves `count` as 0. We use `_parse_count()` in both `download_historical.py` and `update_forward.py` to set stored `count` from `count_fp` when `count` is 0. For older data already on disk, use `count_fp` (or `COALESCE(NULLIF(count, 0), CAST(count_fp AS INT))`) in analytics.
+- **Volume outlier:** A few headline markets (e.g. Presidency) have volume orders of magnitude above typical. The validator only WARNs if max volume is > 15,000× the 99th percentile, so normal skew does not trigger it.
