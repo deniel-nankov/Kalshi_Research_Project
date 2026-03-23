@@ -12,6 +12,7 @@ This folder holds the docs you need to run and understand the **Kalshi historica
 | **[Data schemas](SCHEMAS.md)** | Parquet file structure for markets and trades: column names, types, and example queries. Use this when you write analytics or validation. |
 | **[Data validation checklist](DATA_VALIDATION_CHECKLIST.md)** | What we check for every column and across datasets, and how each check maps to the validator. Use this to understand what “healthy data” means. |
 | **[Health report warnings examined](HEALTH_REPORT_WARNINGS_EXAMINED.md)** | Each WARN from the health report explained: what it means, how serious it is, what to do (including how to backfill a boundary gap), and short technical notes on causes and prevention. |
+| **[Kalshi Data comparison](KALSHIDATA_COMPARISON.md)** | Our stats vs [kalshidata.com](https://www.kalshidata.com): definitions, latest numbers, and a table to paste official figures. |
 
 ---
 

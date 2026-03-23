@@ -166,3 +166,19 @@ We rely on these tests to ensure that the pipeline and validation behave correct
 - **[docs/KALSHI_DATA_PIPELINE_SUMMARY.md](docs/KALSHI_DATA_PIPELINE_SUMMARY.md)** — The main document: how the pipeline works, what each script does and when to run it, problems we ran into and how we fixed them, and how we keep the dataset consistent. Start here if you want the full picture.
 
 For health-report warnings and how to fix them (including backfilling a gap), see **[docs/HEALTH_REPORT_WARNINGS_EXAMINED.md](docs/HEALTH_REPORT_WARNINGS_EXAMINED.md)**.
+
+To compare our numbers with **[Kalshi Data](https://www.kalshidata.com)** and save a snapshot:
+
+```bash
+uv run python scripts/data_stats.py | tee data/kalshi/state/dataset_stats_latest.txt
+```
+
+See **[docs/KALSHIDATA_COMPARISON.md](docs/KALSHIDATA_COMPARISON.md)** for definitions and a table to fill in with official stats.
+
+**How far are you from official Kalshi Data?** Update `data/kalshi/state/kalshidata_baseline.json` with current numbers from [kalshidata.com](https://www.kalshidata.com), then run:
+
+```bash
+uv run python scripts/compare_to_kalshidata.py
+```
+
+It shows your **share of official volume (USD)** and explains which metrics you **cannot** compare directly (e.g. their “Total Trades”).

@@ -172,11 +172,11 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         orphan = con.execute(
             f"""
             SELECT COUNT(*) FROM (
-                SELECT DISTINCT t.ticker FROM ({trades_sql}) t
-                WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+                SELECT DISTINCT trim(CAST(t.ticker AS VARCHAR)) AS ticker FROM ({trades_sql}) t
+                WHERE t.ticker IS NOT NULL AND trim(CAST(t.ticker AS VARCHAR)) <> ''
                 EXCEPT
-                SELECT DISTINCT m.ticker FROM ({markets_sql}) m
-                WHERE m.ticker IS NOT NULL AND m.ticker <> ''
+                SELECT DISTINCT trim(CAST(m.ticker AS VARCHAR)) AS ticker FROM ({markets_sql}) m
+                WHERE m.ticker IS NOT NULL AND trim(CAST(m.ticker AS VARCHAR)) <> ''
             ) o
             """
         ).fetchone()[0]

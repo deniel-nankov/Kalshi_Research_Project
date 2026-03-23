@@ -227,6 +227,24 @@ def test_second_run_is_idempotent_with_existing_incremental_files(tmp_path, monk
     assert distinct_count == 1
 
 
+def test_market_api_slices_contiguous_cover_range():
+    module = load_update_forward_module()
+    # min_ts_exclusive=1000, lookback 7d => lo = max(1001 - 7d, 0)
+    min_ex = 1000
+    max_in = 1000 + 3 * 86400  # +3 days
+    lo = max(min_ex + 1 - 7 * 86400, 0)
+    slices = module._iter_market_api_close_ts_slices(min_ex, max_in, 86400)
+    assert slices[0][0] == lo
+    assert slices[-1][1] == max_in
+    # Contiguous: next slice starts at prev end + 1
+    for i in range(len(slices) - 1):
+        assert slices[i + 1][0] == slices[i][1] + 1
+    # slice_seconds=0 => single slice
+    one = module._iter_market_api_close_ts_slices(min_ex, max_in, 0)
+    assert len(one) == 1
+    assert one[0] == (lo, max_in)
+
+
 def test_noop_when_upper_bound_not_ahead(tmp_path, monkeypatch):
     module = load_update_forward_module()
     patch_paths(module, tmp_path)

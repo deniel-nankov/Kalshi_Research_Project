@@ -46,7 +46,10 @@ LEGACY_FORWARD_MARKETS_GLOB = KALSHI_DATA_DIR / "incremental" / "markets" / "*" 
 
 # ─── API ──────────────────────────────────────────────────────────────────
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-MARKETS_PATH = "/historical/markets"
+HISTORICAL_MARKETS_PATH = "/historical/markets"
+LIVE_MARKETS_PATH = "/markets"
+# Backward-compat alias (prefer explicit HISTORICAL_MARKETS_PATH/LIVE_MARKETS_PATH)
+MARKETS_PATH = HISTORICAL_MARKETS_PATH
 MARKET_TRADES_PATH = "/markets/trades"
 HISTORICAL_CUTOFF_PATH = "/historical/cutoff"
 CUTOFF_URL = f"{BASE_URL}{HISTORICAL_CUTOFF_PATH}"

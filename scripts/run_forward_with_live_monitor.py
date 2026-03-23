@@ -11,6 +11,9 @@ This wrapper runs scripts/update_forward.py and prints:
 Defaults to live mode (upper bound = now). Use --historical-only for catch-up
 to the API historical cutoff only.
 
+(This is the “live update” wrapper — there is no separate run_forward_with_live_update script;
+it always delegates to scripts/update_forward.py.)
+
 Examples:
   uv run python scripts/run_forward_with_live_monitor.py
   uv run python scripts/run_forward_with_live_monitor.py --historical-only
@@ -28,6 +31,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
 
 import argparse
 import json
+import os
 import signal
 import subprocess
 import time
@@ -97,18 +101,28 @@ def build_cmd(args: argparse.Namespace) -> list[str]:
     cmd = [sys.executable, str(PROJECT_ROOT / "scripts" / "update_forward.py")]
     if args.historical_only:
         cmd.append("--historical-only")
+    if args.chunk_days is not None:
+        cmd.extend(["--chunk-days", str(args.chunk_days)])
+    if args.end_ts is not None:
+        cmd.extend(["--end-ts", str(args.end_ts)])
     if args.lookback_seconds is not None:
         cmd.extend(["--lookback-seconds", str(args.lookback_seconds)])
     if args.max_trade_pages is not None:
         cmd.extend(["--max-trade-pages", str(args.max_trade_pages)])
     if args.max_market_pages is not None:
         cmd.extend(["--max-market-pages", str(args.max_market_pages)])
+    if args.progress_verbose:
+        cmd.append("--progress-verbose")
+    if args.resource_log_seconds is not None and args.resource_log_seconds > 0:
+        cmd.extend(["--resource-log-seconds", str(args.resource_log_seconds)])
     if args.dry_run:
         cmd.append("--dry-run")
     if getattr(args, "bootstrap_from_historical", None) is True:
         cmd.append("--bootstrap-from-historical")
     if args.start_ts is not None:
         cmd.extend(["--start-ts", str(args.start_ts)])
+    if getattr(args, "market_slice_hours", None) is not None:
+        cmd.extend(["--market-slice-hours", str(args.market_slice_hours)])
     return cmd
 
 
@@ -182,13 +196,24 @@ def main() -> int:
         default=False,
         help="Use API historical cutoff as upper bound (default: False = live now)",
     )
+    parser.add_argument("--chunk-days", type=int, default=7, help="Chunk size in days passed to update_forward")
+    parser.add_argument("--end-ts", type=int, default=None, help="Optional UNIX upper bound timestamp")
     parser.add_argument("--lookback-seconds", type=int, default=None)
     parser.add_argument("--max-trade-pages", type=int, default=None)
     parser.add_argument("--max-market-pages", type=int, default=None)
+    parser.add_argument("--progress-verbose", action="store_true", help="Enable phase-by-phase logs in update_forward")
+    parser.add_argument("--resource-log-seconds", type=float, default=5.0, help="Log RAM/CPU every N seconds in update_forward")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--bootstrap-from-historical", action="store_true", help="Bootstrap checkpoint from historical cutoff when missing")
     parser.add_argument("--start-ts", type=int, default=None, help="Bootstrap start timestamp when checkpoint missing")
     parser.add_argument("--monitor-interval", type=float, default=5.0)
+    parser.add_argument(
+        "--market-slice-hours",
+        type=float,
+        default=None,
+        metavar="H",
+        help="Forwarded to update_forward (omit to use its default, 12h; 0 = single long market fetch)",
+    )
     args = parser.parse_args()
 
     cmd = build_cmd(args)
@@ -199,6 +224,8 @@ def main() -> int:
     print("monitor interval:", f"{args.monitor_interval:.1f}s")
     print("-" * 88)
 
+    # Child stdout is a pipe (not a TTY), so Python may block-buffer logs unless unbuffered.
+    child_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen(
         cmd,
         cwd=PROJECT_ROOT,
@@ -206,6 +233,7 @@ def main() -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        env=child_env,
     )
 
     def _forward_signal(signum, frame):

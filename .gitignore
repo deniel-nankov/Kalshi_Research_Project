@@ -27,3 +27,10 @@ fig
 *.tar.zst
 output
 .tmp
+
+# DuckDB spill during large dedupe jobs
+data/kalshi/state/duckdb_dedupe_spill/
+
+# Local run logs / pid files (do not commit)
+data/kalshi/state/*.log
+data/kalshi/state/*.pid

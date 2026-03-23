@@ -463,4 +463,21 @@ All paths come from **`src/kalshi_forward/paths.py`** (e.g. `HISTORICAL_TRADES_G
 
 ---
 
+## 16. Comparison with official Kalshi data (e.g. kalshidata.com)
+
+**[Kalshi Data and Analytics](https://www.kalshidata.com)** is an official/supported Kalshi data site. Our pipeline uses the same underlying Kalshi historical/API data but different tooling and definitions, so totals can differ.
+
+**What we output (from `scripts/data_stats.py`):** Total trades, total markets, unique tickers, date range, **total contracts** (using `count_fp` when `count=0`), and **est. notional USD** (contracts × `yes_price_dollars`, because the API often has `yes_price=0` but still fills dollars). See **[docs/KALSHIDATA_COMPARISON.md](KALSHIDATA_COMPARISON.md)** for a comparison table with [kalshidata.com](https://www.kalshidata.com). Use the same definitions and date range when comparing.
+
+**Why differences are often large:**
+
+1. **Volume undercount (fixed in our stats):** Most stored rows had `count=0` and size in `count_fp`. If you sum only `count`, contracts and dollar volume are far too low. We now use `COALESCE(NULLIF(count,0), TRY_CAST(count_fp AS DOUBLE))` in `data_stats.py` so totals are comparable to official-style numbers.
+2. **Definitions:** "Markets" can mean all listed vs only traded; volume can be contracts vs USD; "as of" date can differ.
+3. **Coverage:** We depend on historical cutoff + forward runs; gaps or different cutoffs change totals.
+4. **Orphans / dedupe:** We may include or exclude different sets of trades/markets.
+
+**How to align:** Run `uv run python scripts/data_stats.py` and compare trades, markets, date range, total contracts, and dollar volume with kalshidata.com (or any other source) using the same definitions. Document your methodology (source, date range, count/volume formula) so comparisons are meaningful.
+
+---
+
 This document is the single place that ties together: **what** we did (timeline), **how** the pipeline works (historical vs forward, storage, Parquet), **what** went wrong (count=0, orphans, duplicate keys, gap, 403), **how** we fixed it, **how** we keep the dataset healthy and duplication under control, and **how** we store and use the data for analytics.

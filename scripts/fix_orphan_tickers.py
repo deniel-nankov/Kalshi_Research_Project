@@ -8,11 +8,14 @@ Usage:
   uv run python scripts/fix_orphan_tickers.py --dry-run   # list orphans only
   uv run python scripts/fix_orphan_tickers.py             # fetch and append (with progress)
   uv run python scripts/fix_orphan_tickers.py --delay 0.3  # delay between API calls (default 0.2)
+  uv run python scripts/fix_orphan_tickers.py --max 5000  # cap this run (large sets need many runs)
+  uv run python scripts/fix_orphan_tickers.py --checkpoint data/kalshi/state/orphan_backfill_checkpoint.txt
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import time
 from datetime import datetime, timezone
@@ -93,17 +96,35 @@ def _get_orphan_tickers(con: duckdb.DuckDBPyConnection) -> list[str]:
         return []
 
     query = f"""
-        SELECT DISTINCT t.ticker
+        SELECT DISTINCT trim(CAST(t.ticker AS VARCHAR)) AS ticker
         FROM ({trades_sql}) t
-        WHERE t.ticker IS NOT NULL AND t.ticker <> ''
+        WHERE t.ticker IS NOT NULL AND trim(CAST(t.ticker AS VARCHAR)) <> ''
         EXCEPT
-        SELECT DISTINCT m.ticker
+        SELECT DISTINCT trim(CAST(m.ticker AS VARCHAR)) AS ticker
         FROM ({markets_sql}) m
-        WHERE m.ticker IS NOT NULL AND m.ticker <> ''
+        WHERE m.ticker IS NOT NULL AND trim(CAST(m.ticker AS VARCHAR)) <> ''
         ORDER BY ticker
     """
     rows = con.execute(query).fetchall()
     return [r[0] for r in rows]
+
+
+def _load_checkpoint(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    done: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        done.add(line)
+    return done
+
+
+def _append_checkpoint(path: Path, ticker: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(ticker + "\n")
 
 
 def main() -> int:
@@ -111,6 +132,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch missing markets for orphan tickers")
     parser.add_argument("--dry-run", action="store_true", help="Only list orphan tickers, do not call API")
     parser.add_argument("--delay", type=float, default=0.2, help="Seconds between API calls (default 0.2)")
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Process at most N tickers this run (after checkpoint filter)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=None,
+        help="Text file: one ticker per line already processed; append on success (resume long runs)",
+    )
+    parser.add_argument(
+        "--batch-rows",
+        type=int,
+        default=50_000,
+        help="Flush Parquet part after this many rows (default 50000)",
+    )
     args = parser.parse_args()
 
     dry = args.dry_run
@@ -128,6 +168,22 @@ def main() -> int:
     _log(f"Orphan tickers (in trades but not in markets): {len(orphans):,}")
     if not orphans:
         _log("None. REFERENTIAL_INTEGRITY is already satisfied.")
+        return 0
+
+    done: set[str] = set()
+    if args.checkpoint:
+        done = _load_checkpoint(args.checkpoint)
+        if done:
+            before = len(orphans)
+            orphans = [t for t in orphans if t not in done]
+            _log(f"Checkpoint: skipping {before - len(orphans):,} already done; {len(orphans):,} remaining")
+
+    if args.max is not None and len(orphans) > args.max:
+        _log(f"Capping this run to --max {args.max:,} tickers ({len(orphans):,} would run otherwise).")
+        orphans = orphans[: args.max]
+
+    if not orphans:
+        _log("Nothing to do after checkpoint / --max.")
         return 0
 
     if len(orphans) <= 30:
@@ -160,6 +216,20 @@ def main() -> int:
     found = 0
     not_found = 0
     errors = 0
+    parts_written = 0
+    dt_partition = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = FORWARD_MARKETS_DIR / f"dt={dt_partition}"
+
+    def flush_batch() -> None:
+        nonlocal rows, parts_written
+        if not rows:
+            return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / f"markets_{run_id}_part{parts_written}.parquet"
+        _log(f"Writing part {parts_written} -> {out_file.name} ({len(rows):,} rows)")
+        atomic_write_parquet(out_file, rows, schema=MARKET_SCHEMA)
+        parts_written += 1
+        rows = []
 
     with httpx.Client(timeout=15.0) as client:
         for i, ticker in enumerate(orphans, 1):
@@ -172,10 +242,16 @@ def main() -> int:
                     row = market_row_from_api(m, run_id=run_id, ingested_at=ingested_at)
                     rows.append(row)
                     found += 1
-                    if found <= 10 or found % 100 == 0 or found == len(orphans):
+                    if args.checkpoint:
+                        _append_checkpoint(args.checkpoint, ticker)
+                    if found <= 10 or found % 100 == 0 or i == len(orphans):
                         _log(f"  [{i}/{len(orphans)}] {ticker}  -> 200 OK (total fetched: {found})")
+                    if len(rows) >= args.batch_rows:
+                        flush_batch()
                 elif resp.status_code == 404:
                     not_found += 1
+                    if args.checkpoint:
+                        _append_checkpoint(args.checkpoint, ticker)
                     if not_found <= 5:
                         _log(f"  [{i}/{len(orphans)}] {ticker}  -> 404 Not Found")
                 else:
@@ -186,27 +262,33 @@ def main() -> int:
                 _log(f"  [{i}/{len(orphans)}] {ticker}  -> ERROR: {e}")
             time.sleep(args.delay)
 
+    flush_batch()
+
     _log("")
     _log(f"Summary: fetched={found}, 404={not_found}, errors={errors}")
 
-    if not rows:
+    if parts_written == 0:
         _section("DONE (nothing to write)")
         _log("No markets could be fetched; dataset unchanged.")
         return 0
 
-    # ─── Step 4: Write to forward_markets ─────────────────────────────────────
-    _section("STEP 4: Write to forward_markets")
-    dt_partition = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    out_dir = FORWARD_MARKETS_DIR / f"dt={dt_partition}"
-    out_file = out_dir / f"markets_{run_id}.parquet"
-    _log(f"Output: {out_file}")
-    _log(f"Rows:   {len(rows):,}")
-    atomic_write_parquet(out_file, rows, schema=MARKET_SCHEMA)
-    _log("Written.")
+    # ─── Step 4: Write summary ─────────────────────────────────────────────────
+    _section("STEP 4: Output")
+    _log(f"Wrote {parts_written} parquet part(s) under {out_dir}")
+    meta = {
+        "run_id": run_id,
+        "parts": parts_written,
+        "fetched": found,
+        "not_found": not_found,
+        "errors": errors,
+    }
+    meta_path = out_dir / f"orphan_backfill_{run_id}_meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _log(f"Meta: {meta_path}")
 
     _section("DONE")
-    _log(f"Added {len(rows):,} markets for previously orphan tickers.")
-    _log("Re-run the health validator to check REFERENTIAL_INTEGRITY.")
+    _log(f"Added markets for {found:,} previously orphan tickers (404/404 also checkpointed when using --checkpoint).")
+    _log("Re-run: uv run python scripts/validate_data_health.py")
     return 0
 
 

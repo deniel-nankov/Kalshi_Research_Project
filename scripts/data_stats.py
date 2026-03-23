@@ -17,6 +17,7 @@ from src.kalshi_forward.paths import (
     FORWARD_TRADES_GLOB,
     HISTORICAL_MARKETS_FILE,
     HISTORICAL_TRADES_GLOB,
+    LEGACY_FORWARD_TRADES_GLOB,
 )
 
 
@@ -74,19 +75,64 @@ def main() -> None:
     print(f"  Unique tickers:      {r[0]:,}")
     print(f"  Date range:          {r[1]} .. {r[2]}")
 
-    # Contract volume (count)
-    try:
-        vol = con.execute(f"SELECT SUM(count) FROM ({trade_sql}) t").fetchone()[0] or 0
-        print(f"  Total contracts:    {vol:,}")
-    except Exception:
-        print("  Total contracts:    (column not available)")
+    # Contract volume: use count_fp when count=0 so totals are comparable to official sources (e.g. kalshidata.com)
+    vol = 0.0
+    trade_patterns = [
+        (str(HISTORICAL_TRADES_GLOB), "hist"),
+        (str(FORWARD_TRADES_GLOB), "fwd"),
+    ]
+    if has_any(LEGACY_FORWARD_TRADES_GLOB):
+        trade_patterns.append((str(LEGACY_FORWARD_TRADES_GLOB), "legacy_fwd"))
+    for pattern, label in trade_patterns:
+        if not glob.glob(pattern):
+            continue
+        try:
+            q = f"""
+                SELECT SUM(COALESCE(NULLIF(count, 0), TRY_CAST(count_fp AS DOUBLE)))
+                FROM read_parquet('{pattern}')
+            """
+            vol += con.execute(q).fetchone()[0] or 0
+        except Exception:
+            q = f"SELECT SUM(count) FROM read_parquet('{pattern}')"
+            vol += con.execute(q).fetchone()[0] or 0
+    if vol > 0:
+        print(f"  Total contracts:    {vol:,.0f}")
+    else:
+        print("  Total contracts:    (no data or column not available)")
 
-    # Dollar volume (contracts * yes_price / 100)
-    try:
-        dv = con.execute(f"SELECT SUM(count * yes_price / 100.0) FROM ({trade_sql}) t").fetchone()[0] or 0
-        print(f"  Est. dollar volume: ${dv:,.0f} USD")
-    except Exception:
-        print("  Est. dollar volume: (skip)")
+    # Dollar notional: API often leaves yes_price=0 but fills yes_price_dollars (per-contract USD)
+    dv_cents = 0.0
+    dv_dollars = 0.0
+    for pattern, _ in trade_patterns:
+        if not glob.glob(pattern):
+            continue
+        try:
+            q = f"""
+                SELECT SUM(COALESCE(NULLIF(count, 0), TRY_CAST(count_fp AS DOUBLE)) * yes_price / 100.0)
+                FROM read_parquet('{pattern}')
+            """
+            dv_cents += con.execute(q).fetchone()[0] or 0
+        except Exception:
+            pass
+        try:
+            q = f"""
+                SELECT SUM(COALESCE(NULLIF(count, 0), TRY_CAST(count_fp AS DOUBLE)) * TRY_CAST(yes_price_dollars AS DOUBLE))
+                FROM read_parquet('{pattern}')
+            """
+            dv_dollars += con.execute(q).fetchone()[0] or 0
+        except Exception:
+            try:
+                q = f"""
+                    SELECT SUM(COALESCE(NULLIF(count, 0), TRY_CAST(count_fp AS DOUBLE)) * yes_price / 100.0)
+                    FROM read_parquet('{pattern}')
+                """
+                dv_dollars += con.execute(q).fetchone()[0] or 0
+            except Exception:
+                pass
+    if dv_dollars > 0:
+        print(f"  Est. notional USD:   ${dv_dollars:,.0f}  (contracts × yes_price_dollars; compare to kalshidata.com)")
+    if dv_cents > 0 and dv_cents != dv_dollars:
+        print(f"  (alt: cents only)    ${dv_cents:,.0f}  (only rows where yes_price > 0)")
 
     print()
     print("  Top 5 tickers by trade count:")

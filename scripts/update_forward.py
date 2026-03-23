@@ -18,7 +18,13 @@ Examples:
   uv run python scripts/update_forward.py
   uv run python scripts/update_forward.py --dry-run
   uv run python scripts/update_forward.py --historical-only
+  uv run python scripts/update_forward.py --markets-only --chunk-days 7
   uv run python scripts/update_forward.py --lookback-seconds 43200
+  uv run python scripts/update_forward.py --chunk-days 30   # process in 30-day chunks, write + checkpoint each chunk (resumable)
+  uv run python scripts/update_forward.py --chunk-days 7 --progress-verbose --resource-log-seconds 5
+  uv run python scripts/update_forward.py --chunk-days 3 --market-slice-hours 12   # explicit 12h slices (default is 12)
+  uv run python scripts/update_forward.py --market-slice-hours 24   # wider slices if you prefer fewer cursors
+  uv run python scripts/update_forward.py --market-slice-hours 0   # one long /markets pagination (legacy)
 """
 
 from __future__ import annotations
@@ -32,12 +38,16 @@ if str(_SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_ROOT))
 
 import argparse
+import gc
 import json
 import logging
 import os
 import signal
+import subprocess
+import threading
 import time
 import uuid
+import resource
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -60,14 +70,15 @@ from src.kalshi_forward.paths import (
     HISTORICAL_CHECKPOINT_FILE,
     HISTORICAL_CUTOFF_PATH,
     HISTORICAL_MARKETS_FILE,
+    HISTORICAL_MARKETS_PATH,
     HISTORICAL_TRADES_GLOB,
+    LIVE_MARKETS_PATH,
     LEGACY_FORWARD_MARKETS_GLOB,
     LEGACY_FORWARD_TRADES_GLOB,
     LEGACY_MARKETS_GLOB,
     LEGACY_TRADES_GLOB,
     LOCK_FILE,
     MARKET_TRADES_PATH,
-    MARKETS_PATH,
     RUN_MANIFEST_DIR,
     STATE_DIR,
 )
@@ -158,6 +169,104 @@ def atomic_write_parquet(path: Path, rows: list[dict], schema: Optional[pa.Schem
 
 def safe_glob_exists(pattern: Path) -> bool:
     return any(pattern.parent.glob(pattern.name))
+
+
+def _fmt_metrics(metrics: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, int):
+            parts.append(f"{key}={value:,}")
+        elif isinstance(value, float):
+            parts.append(f"{key}={value:.2f}")
+        else:
+            parts.append(f"{key}={value}")
+    return " | ".join(parts)
+
+
+def log_phase_start(enabled: bool, phase: str, **metrics: Any):
+    if not enabled:
+        return
+    suffix = _fmt_metrics(metrics)
+    if suffix:
+        log.info("[phase] %s start | %s", phase, suffix)
+    else:
+        log.info("[phase] %s start", phase)
+
+
+def log_phase_end(enabled: bool, phase: str, started_at: float, **metrics: Any):
+    if not enabled:
+        return
+    elapsed_s = max(time.time() - started_at, 1e-6)
+    metric_data: dict[str, Any] = {"elapsed_s": elapsed_s}
+    metric_data.update(metrics)
+    suffix = _fmt_metrics(metric_data)
+    log.info("[phase] %s done  | %s", phase, suffix)
+
+
+def _read_process_usage(pid: int) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Return rss_mb, cpu_pct, cpu_time_s for this process (cpu_pct from ps when available)."""
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        cpu_time_s = usage.ru_utime + usage.ru_stime
+        # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
+        if sys.platform == "darwin":
+            rss_mb = float(usage.ru_maxrss) / (1024.0 * 1024.0)
+        else:
+            rss_mb = float(usage.ru_maxrss) / 1024.0
+    except Exception:
+        rss_mb, cpu_time_s = None, None
+
+    cpu_pct: Optional[float] = None
+    try:
+        out = subprocess.check_output(
+            ["ps", "-o", "rss=,%cpu=", "-p", str(pid)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+        if out:
+            if "," in out:
+                rss_kb_s, cpu_pct_s = out.split(",", 1)
+            else:
+                parts = out.split()
+                if len(parts) >= 2:
+                    rss_kb_s, cpu_pct_s = parts[0], parts[1]
+                else:
+                    rss_kb_s, cpu_pct_s = "", ""
+            if rss_kb_s.strip():
+                rss_mb = float(rss_kb_s.strip()) / 1024.0
+            if cpu_pct_s.strip():
+                cpu_pct = float(cpu_pct_s.strip())
+    except Exception:
+        pass
+
+    if rss_mb is None and cpu_time_s is None:
+        return None, None, None
+    return rss_mb, cpu_pct, cpu_time_s
+
+
+def start_resource_logger(interval_seconds: float) -> tuple[Optional[threading.Thread], Optional[threading.Event]]:
+    if interval_seconds <= 0:
+        return None, None
+
+    stop_event = threading.Event()
+    pid = os.getpid()
+
+    def _worker():
+        while not stop_event.wait(interval_seconds):
+            rss_mb, cpu_pct, cpu_time_s = _read_process_usage(pid)
+            if rss_mb is None and cpu_time_s is None:
+                log.info("[resource] pid=%s usage unavailable", pid)
+            elif cpu_pct is None:
+                log.info("[resource] pid=%s maxrss_mb=%.1f cpu_time_s=%.1f", pid, rss_mb or 0.0, cpu_time_s or 0.0)
+            else:
+                log.info("[resource] pid=%s rss_mb=%.1f cpu_pct=%.1f cpu_time_s=%.1f", pid, rss_mb, cpu_pct, cpu_time_s or 0.0)
+
+    thread = threading.Thread(target=_worker, name="resource-logger", daemon=True)
+    thread.start()
+    return thread, stop_event
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -590,6 +699,8 @@ def fetch_trade_deltas(
     cursor: Optional[str] = None
     page = 0
     started = time.time()
+    last_tick_time = started
+    last_tick_rows = 0
 
     while True:
         if _shutdown_requested:
@@ -613,12 +724,18 @@ def fetch_trade_deltas(
         rows.extend(trade_row_from_api(t, run_id=run_id, ingested_at=ingested_at) for t in trade_rows)
 
         if page % 25 == 0:
-            elapsed = max(time.time() - started, 1e-6)
+            now = time.time()
+            elapsed_total = max(now - started, 1e-6)
+            elapsed_seg = max(now - last_tick_time, 1e-6)
+            delta_rows = len(rows) - last_tick_rows
+            last_tick_time = now
+            last_tick_rows = len(rows)
             log.info(
-                "Trades fetch progress: pages=%s rows=%s rate=%.1f rows/s",
+                "Trades fetch progress: pages=%s rows=%s avg_rate=%.1f rows/s recent_rate=%.1f rows/s",
                 f"{page:,}",
                 f"{len(rows):,}",
-                len(rows) / elapsed,
+                len(rows) / elapsed_total,
+                delta_rows / elapsed_seg,
             )
 
         cursor = data.get("cursor")
@@ -632,35 +749,68 @@ def fetch_trade_deltas(
     return rows
 
 
-def fetch_market_deltas(
+def _iter_market_api_close_ts_slices(
+    min_ts_exclusive: int,
+    max_ts_inclusive: int,
+    slice_seconds: int,
+) -> list[tuple[int, int]]:
+    """Split API close_ts range into contiguous [api_min, api_max] slices (inclusive)."""
+    market_lookback = MARKET_LOOKBACK_DAYS * 24 * 60 * 60
+    lo = max(min_ts_exclusive + 1 - market_lookback, 0)
+    hi = max_ts_inclusive
+    if hi < lo:
+        return [(lo, hi)]
+    if slice_seconds <= 0 or (hi - lo) <= slice_seconds:
+        return [(lo, hi)]
+    out: list[tuple[int, int]] = []
+    cur = lo
+    while cur <= hi:
+        seg_end = min(cur + slice_seconds, hi)
+        out.append((cur, seg_end))
+        cur = seg_end + 1
+    return out
+
+
+def _fetch_market_deltas_single_api_window(
     client: RobustClient,
     min_ts_exclusive: int,
     max_ts_inclusive: int,
+    api_min_close_ts: int,
+    api_max_close_ts: int,
     run_id: str,
     max_pages: Optional[int],
-) -> list[dict]:
+    market_path: str,
+    *,
+    slice_index: int,
+    num_slices: int,
+    page_global_start: int,
+    scanned_global_start: int,
+    started: float,
+    last_tick_time: float,
+    last_tick_scanned: int,
+    seen_key_in_fetch: set[str],
+    rows: list[dict],
+    skip_stats: dict[str, int],
+    periodic_gc_market_pages: int = 0,
+) -> tuple[int, int, float, float, int]:
+    """One cursor chain for [api_min_close_ts, api_max_close_ts]. Mutates rows/seen_key."""
     ingested_at = iso_now()
-    rows: list[dict] = []
-    seen_key_in_fetch: set[str] = set()  # Prevent same (ticker, close_time) from API appearing twice in one run
     cursor: Optional[str] = None
-
     page = 0
     scanned_markets = 0
-    started = time.time()
     while True:
         if _shutdown_requested:
             raise RuntimeError("Shutdown requested during market fetch")
 
-        params: dict[str, Any] = {"limit": MARKET_PAGE_LIMIT}
+        params: dict[str, Any] = {
+            "limit": MARKET_PAGE_LIMIT,
+            "min_close_ts": api_min_close_ts,
+            "max_close_ts": api_max_close_ts,
+        }
         if cursor:
             params["cursor"] = cursor
-        # Widen market window backwards so we pull markets that closed before the trade window
-        # (reduces orphan tickers: trades can reference markets that closed slightly earlier).
-        market_lookback = MARKET_LOOKBACK_DAYS * 24 * 60 * 60
-        params["min_close_ts"] = max(min_ts_exclusive + 1 - market_lookback, 0)
-        params["max_close_ts"] = max_ts_inclusive
 
-        data = client.get(MARKETS_PATH, params=params)
+        data = client.get(market_path, params=params)
         page += 1
         markets = data.get("markets", [])
         if not markets:
@@ -672,31 +822,125 @@ def fetch_market_deltas(
             row = market_row_from_api(market, run_id=run_id, ingested_at=ingested_at)
             effective_ts = int(row.get("_effective_ts", 0) or 0)
             if effective_ts <= min_ts_exclusive:
+                skip_stats["skip_eff_ts_low"] = skip_stats.get("skip_eff_ts_low", 0) + 1
                 continue
             if effective_ts > max_ts_inclusive:
+                skip_stats["skip_eff_ts_high"] = skip_stats.get("skip_eff_ts_high", 0) + 1
                 continue
             key = market_key(row)
             if key in seen_key_in_fetch:
+                skip_stats["skip_dup_key"] = skip_stats.get("skip_dup_key", 0) + 1
                 continue
             seen_key_in_fetch.add(key)
             rows.append(row)
 
-        if page % 25 == 0:
-            elapsed = max(time.time() - started, 1e-6)
+        global_page = page_global_start + page
+        global_scanned = scanned_global_start + scanned_markets
+        if periodic_gc_market_pages > 0 and global_page % periodic_gc_market_pages == 0:
+            gc.collect()
+
+        if global_page % 25 == 0:
+            now = time.time()
+            elapsed_total = max(now - started, 1e-6)
+            elapsed_seg = max(now - last_tick_time, 1e-6)
+            delta_scanned = global_scanned - last_tick_scanned
+            last_tick_time = now
+            last_tick_scanned = global_scanned
+            sk_low = skip_stats.get("skip_eff_ts_low", 0)
+            sk_hi = skip_stats.get("skip_eff_ts_high", 0)
+            sk_dup = skip_stats.get("skip_dup_key", 0)
             log.info(
-                "Markets fetch progress: pages=%s scanned=%s matched=%s rate=%.1f markets/s",
-                f"{page:,}",
-                f"{scanned_markets:,}",
+                "Markets fetch progress: slice=%s/%s pages=%s scanned=%s kept=%s "
+                "(skipped eff_ts≤min=%s eff_ts>max=%s dup_key=%s) "
+                "avg_rate=%.1f markets/s recent_rate=%.1f markets/s",
+                slice_index,
+                num_slices,
+                f"{global_page:,}",
+                f"{global_scanned:,}",
                 f"{len(rows):,}",
-                scanned_markets / elapsed,
+                f"{sk_low:,}",
+                f"{sk_hi:,}",
+                f"{sk_dup:,}",
+                global_scanned / elapsed_total,
+                delta_scanned / elapsed_seg,
             )
 
         cursor = data.get("cursor")
         if not cursor:
             break
 
-        if max_pages is not None and page >= max_pages:
+        if max_pages is not None and (page_global_start + page) >= max_pages:
             log.warning("Reached --max-market-pages limit; stopping early")
+            break
+
+    return page, scanned_markets, last_tick_time, last_tick_scanned, page_global_start + page
+
+
+def fetch_market_deltas(
+    client: RobustClient,
+    min_ts_exclusive: int,
+    max_ts_inclusive: int,
+    run_id: str,
+    max_pages: Optional[int],
+    market_path: str,
+    market_slice_hours: float = 0.0,
+    *,
+    periodic_gc_market_pages: int = 0,
+) -> list[dict]:
+    """Fetch markets; optional time-slicing on API close_ts shortens each cursor chain (chunk size unchanged)."""
+    slice_seconds = int(max(0.0, float(market_slice_hours)) * 3600.0)
+    slices = _iter_market_api_close_ts_slices(min_ts_exclusive, max_ts_inclusive, slice_seconds)
+    num_slices = len(slices)
+    if num_slices > 1:
+        log.info(
+            "Market fetch: %s API time slice(s) of ~%s h (fresh cursor each slice; --chunk-days unchanged)",
+            num_slices,
+            market_slice_hours,
+        )
+
+    rows: list[dict] = []
+    seen_key_in_fetch: set[str] = set()
+    skip_stats: dict[str, int] = {}
+    started = time.time()
+    last_tick_time = started
+    last_tick_scanned = 0
+    page_global_start = 0
+    scanned_global_start = 0
+
+    for si, (api_min_close_ts, api_max_close_ts) in enumerate(slices, start=1):
+        if num_slices > 1:
+            log.info(
+                "Markets slice %s/%s API close_ts [%s, %s] (%s → %s)",
+                si,
+                num_slices,
+                api_min_close_ts,
+                api_max_close_ts,
+                iso_from_epoch(api_min_close_ts),
+                iso_from_epoch(api_max_close_ts),
+            )
+        pages_used, scanned_slice, last_tick_time, last_tick_scanned, page_global_start = _fetch_market_deltas_single_api_window(
+            client,
+            min_ts_exclusive,
+            max_ts_inclusive,
+            api_min_close_ts,
+            api_max_close_ts,
+            run_id,
+            max_pages,
+            market_path,
+            slice_index=si,
+            num_slices=num_slices,
+            page_global_start=page_global_start,
+            scanned_global_start=scanned_global_start,
+            started=started,
+            last_tick_time=last_tick_time,
+            last_tick_scanned=last_tick_scanned,
+            seen_key_in_fetch=seen_key_in_fetch,
+            rows=rows,
+            skip_stats=skip_stats,
+            periodic_gc_market_pages=periodic_gc_market_pages,
+        )
+        scanned_global_start += scanned_slice
+        if max_pages is not None and page_global_start >= max_pages:
             break
 
     return rows
@@ -727,6 +971,11 @@ def validate_market_rows(rows: Iterable[dict]):
 def run(args: argparse.Namespace):
     run_id = utc_now().strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
     run_started_at = iso_now()
+    progress_verbose = bool(getattr(args, "progress_verbose", False))
+    resource_log_seconds = float(getattr(args, "resource_log_seconds", 0) or 0)
+    markets_only = bool(getattr(args, "markets_only", False))
+    resource_thread: Optional[threading.Thread] = None
+    resource_stop_event: Optional[threading.Event] = None
 
     cp = ForwardCheckpoint.load_or_create(
         bootstrap_from_historical=args.bootstrap_from_historical,
@@ -741,79 +990,409 @@ def run(args: argparse.Namespace):
     log.info(f"Checkpoint file:           {CHECKPOINT_FILE}")
     log.info(f"Current trade watermark:   {cp.watermark_trade_ts} ({iso_from_epoch(cp.watermark_trade_ts)})")
     log.info(f"Current market watermark:  {cp.watermark_market_ts} ({iso_from_epoch(cp.watermark_market_ts)})")
+    if markets_only:
+        log.info("[config] markets_only=true (trade watermark will not advance)")
+    if progress_verbose:
+        log.info("[config] progress_verbose=true")
+    if resource_log_seconds > 0:
+        log.info("[config] resource_log_seconds=%.1f", resource_log_seconds)
+        log.info(
+            "[resource] rss_mb/cpu_pct are live OS readings (not limits). "
+            "High CPU usually means the client is busy; fluctuating RSS is normal. "
+            "Optional: --periodic-gc-market-pages 100 during huge market scans; only restarting the process fully resets RSS."
+        )
+        resource_thread, resource_stop_event = start_resource_logger(resource_log_seconds)
 
     client = RobustClient()
     try:
+        market_path = HISTORICAL_MARKETS_PATH if args.historical_only else LIVE_MARKETS_PATH
+        log.info(f"Market endpoint:            {market_path}")
+        _msh = float(getattr(args, "market_slice_hours", 12.0) or 0.0)
+        log.info(
+            "Market fetch slice width:  %s h (0 = one cursor for whole window; --chunk-days unchanged)",
+            _msh,
+        )
         base_upper_ts, upper_meta = get_upper_bound_ts(client, historical_only=args.historical_only)
-        upper_bound_ts = min(base_upper_ts, args.end_ts) if args.end_ts is not None else base_upper_ts
-        if args.end_ts is not None:
-            log.info(f"Upper bound capped by --end-ts: {args.end_ts} ({iso_from_epoch(args.end_ts)})")
+        end_ts = getattr(args, "end_ts", None)
+        upper_bound_ts = min(base_upper_ts, end_ts) if end_ts is not None else base_upper_ts
+        if end_ts is not None:
+            log.info(f"Upper bound capped by --end-ts: {end_ts} ({iso_from_epoch(end_ts)})")
         log.info(f"Upper bound mode:          {'historical cutoff' if args.historical_only else 'live now'}")
         log.info(f"Upper bound ts:            {upper_bound_ts} ({iso_from_epoch(upper_bound_ts)})")
 
         min_trade_ts = max(0, cp.watermark_trade_ts - args.lookback_seconds)
         min_market_ts = max(0, cp.watermark_market_ts - args.lookback_seconds)
 
-        if upper_bound_ts <= min_trade_ts and upper_bound_ts <= min_market_ts:
+        no_trade_window = upper_bound_ts <= min_trade_ts
+        no_market_window = upper_bound_ts <= min_market_ts
+        if (markets_only and no_market_window) or ((not markets_only) and no_trade_window and no_market_window):
             log.info("No new window to process; exiting.")
             return
 
-        log.info(f"Trade fetch window:        ({min_trade_ts}, {upper_bound_ts}]")
+        if not markets_only:
+            log.info(f"Trade fetch window:        ({min_trade_ts}, {upper_bound_ts}]")
         log.info(f"Market fetch window:       ({min_market_ts}, {upper_bound_ts}]")
 
         # Existing keys for dedupe (window-bounded)
-        existing_trade_ids = load_existing_trade_ids(min_trade_ts)
+        existing_trade_ids = load_existing_trade_ids(min_trade_ts) if not markets_only else set()
         existing_market_keys = load_existing_market_keys(min_market_ts)
-        log.info(f"Existing trade IDs loaded: {len(existing_trade_ids):,}")
+        if not markets_only:
+            log.info(f"Existing trade IDs loaded: {len(existing_trade_ids):,}")
         log.info(f"Existing market keys:      {len(existing_market_keys):,}")
 
-        # Fetch raw deltas
-        raw_trade_rows = fetch_trade_deltas(
-            client=client,
-            min_ts_exclusive=min_trade_ts,
-            max_ts_inclusive=upper_bound_ts,
-            run_id=run_id,
-            max_pages=args.max_trade_pages,
-        )
+        chunk_days = getattr(args, "chunk_days", 0) or 0
+        chunk_seconds = (chunk_days * 86400) if chunk_days > 0 else 0
+
+        if chunk_seconds > 0:
+            # Process in time chunks: fetch chunk -> write Parquet -> advance checkpoint (resumable)
+            current_start = cp.watermark_market_ts if markets_only else cp.watermark_trade_ts
+            chunk_index = 0
+            total_trade_written = 0
+            total_market_written = 0
+            total_trade_raw = 0
+            total_market_raw = 0
+            total_skipped_trade_dupes = 0
+            total_skipped_market_dupes = 0
+            outputs: list[dict] = []
+
+            while current_start < upper_bound_ts:
+                chunk_end = min(current_start + chunk_seconds, upper_bound_ts)
+                chunk_index += 1
+                run_date_chunk = datetime.fromtimestamp(chunk_end, tz=timezone.utc).strftime("%Y-%m-%d")
+                log.info(
+                    "Chunk %s: window (%s, %s] -> %s",
+                    chunk_index,
+                    iso_from_epoch(current_start),
+                    iso_from_epoch(chunk_end),
+                    run_date_chunk,
+                )
+
+                chunk_min_market_ts = max(0, current_start - (MARKET_LOOKBACK_DAYS * 24 * 60 * 60))
+
+                raw_trade_rows: list[dict] = []
+                if not markets_only:
+                    phase_started = time.time()
+                    log_phase_start(
+                        progress_verbose,
+                        f"chunk{chunk_index}/fetch_trades",
+                        min_ts=current_start,
+                        max_ts=chunk_end,
+                    )
+                    raw_trade_rows = fetch_trade_deltas(
+                        client=client,
+                        min_ts_exclusive=current_start,
+                        max_ts_inclusive=chunk_end,
+                        run_id=run_id,
+                        max_pages=args.max_trade_pages,
+                    )
+                    log_phase_end(
+                        progress_verbose,
+                        f"chunk{chunk_index}/fetch_trades",
+                        phase_started,
+                        rows_raw=len(raw_trade_rows),
+                        rows_per_sec=(len(raw_trade_rows) / max(time.time() - phase_started, 1e-6)),
+                    )
+
+                phase_started = time.time()
+                log_phase_start(
+                    progress_verbose,
+                    f"chunk{chunk_index}/fetch_markets",
+                    min_ts=chunk_min_market_ts,
+                    max_ts=chunk_end,
+                )
+                raw_market_rows = fetch_market_deltas(
+                    client=client,
+                    min_ts_exclusive=chunk_min_market_ts,
+                    max_ts_inclusive=chunk_end,
+                    run_id=run_id,
+                    max_pages=args.max_market_pages,
+                    market_path=market_path,
+                    market_slice_hours=float(getattr(args, "market_slice_hours", 0.0) or 0.0),
+                    periodic_gc_market_pages=int(getattr(args, "periodic_gc_market_pages", 0) or 0),
+                )
+                log_phase_end(
+                    progress_verbose,
+                    f"chunk{chunk_index}/fetch_markets",
+                    phase_started,
+                    rows_raw=len(raw_market_rows),
+                    rows_per_sec=(len(raw_market_rows) / max(time.time() - phase_started, 1e-6)),
+                )
+
+                trade_rows_chunk: list[dict] = []
+                skipped_trade_dupes_existing = 0
+                skipped_trade_dupes_within = 0
+                skipped_trade_dupes = 0
+                if not markets_only:
+                    trade_seen: set[str] = set()
+                    phase_started = time.time()
+                    log_phase_start(progress_verbose, f"chunk{chunk_index}/dedupe_trades", rows_raw=len(raw_trade_rows))
+                    for row in raw_trade_rows:
+                        trade_id = row.get("trade_id", "")
+                        if not trade_id:
+                            continue
+                        if trade_id in trade_seen:
+                            skipped_trade_dupes_within += 1
+                            continue
+                        if trade_id in existing_trade_ids:
+                            skipped_trade_dupes_existing += 1
+                            continue
+                        trade_seen.add(trade_id)
+                        existing_trade_ids.add(trade_id)
+                        trade_rows_chunk.append(row)
+                    skipped_trade_dupes = skipped_trade_dupes_existing + skipped_trade_dupes_within
+                    log_phase_end(
+                        progress_verbose,
+                        f"chunk{chunk_index}/dedupe_trades",
+                        phase_started,
+                        rows_raw=len(raw_trade_rows),
+                        rows_written=len(trade_rows_chunk),
+                        dupes_existing=skipped_trade_dupes_existing,
+                        dupes_within=skipped_trade_dupes_within,
+                    )
+
+                market_seen: set[str] = set()
+                market_rows_chunk: list[dict] = []
+                skipped_market_dupes_existing = 0
+                skipped_market_dupes_within = 0
+                phase_started = time.time()
+                log_phase_start(progress_verbose, f"chunk{chunk_index}/dedupe_markets", rows_raw=len(raw_market_rows))
+                for row in raw_market_rows:
+                    key = market_key(row)
+                    if key in market_seen:
+                        skipped_market_dupes_within += 1
+                        continue
+                    if key in existing_market_keys:
+                        skipped_market_dupes_existing += 1
+                        continue
+                    market_seen.add(key)
+                    existing_market_keys.add(key)
+                    market_rows_chunk.append(row)
+                skipped_market_dupes = skipped_market_dupes_existing + skipped_market_dupes_within
+                log_phase_end(
+                    progress_verbose,
+                    f"chunk{chunk_index}/dedupe_markets",
+                    phase_started,
+                    rows_raw=len(raw_market_rows),
+                    rows_written=len(market_rows_chunk),
+                    dupes_existing=skipped_market_dupes_existing,
+                    dupes_within=skipped_market_dupes_within,
+                )
+
+                phase_started = time.time()
+                log_phase_start(progress_verbose, f"chunk{chunk_index}/validate_rows")
+                if not markets_only:
+                    validate_trade_rows(trade_rows_chunk)
+                validate_market_rows(market_rows_chunk)
+                log_phase_end(
+                    progress_verbose,
+                    f"chunk{chunk_index}/validate_rows",
+                    phase_started,
+                    trade_rows=len(trade_rows_chunk),
+                    market_rows=len(market_rows_chunk),
+                )
+
+                total_trade_raw += len(raw_trade_rows)
+                total_market_raw += len(raw_market_rows)
+                total_skipped_trade_dupes += skipped_trade_dupes
+                total_skipped_market_dupes += skipped_market_dupes
+                total_trade_written += len(trade_rows_chunk)
+                total_market_written += len(market_rows_chunk)
+
+                log.info(
+                    "Chunk %s: trades raw=%s written=%s (skipped %s dupes); markets raw=%s written=%s (skipped %s dupes)",
+                    chunk_index,
+                    f"{len(raw_trade_rows):,}",
+                    f"{len(trade_rows_chunk):,}",
+                    skipped_trade_dupes,
+                    f"{len(raw_market_rows):,}",
+                    f"{len(market_rows_chunk):,}",
+                    skipped_market_dupes,
+                )
+
+                written_trade_path_chunk: Optional[Path] = None
+                written_market_path_chunk: Optional[Path] = None
+                if not args.dry_run:
+                    phase_started = time.time()
+                    log_phase_start(progress_verbose, f"chunk{chunk_index}/write_parquet")
+                    if trade_rows_chunk:
+                        fname_t = f"trades_{run_id}_chunk{chunk_index}.parquet"
+                        written_trade_path_chunk = FORWARD_TRADES_DIR / f"dt={run_date_chunk}" / fname_t
+                        written_trade_path_chunk.parent.mkdir(parents=True, exist_ok=True)
+                        atomic_write_parquet(written_trade_path_chunk, trade_rows_chunk, schema=TRADE_SCHEMA)
+                    if market_rows_chunk:
+                        fname_m = f"markets_{run_id}_chunk{chunk_index}.parquet"
+                        written_market_path_chunk = FORWARD_MARKETS_DIR / f"dt={run_date_chunk}" / fname_m
+                        written_market_path_chunk.parent.mkdir(parents=True, exist_ok=True)
+                        atomic_write_parquet(written_market_path_chunk, market_rows_chunk, schema=MARKET_SCHEMA)
+                    log_phase_end(
+                        progress_verbose,
+                        f"chunk{chunk_index}/write_parquet",
+                        phase_started,
+                        trade_rows=len(trade_rows_chunk),
+                        market_rows=len(market_rows_chunk),
+                    )
+
+                    phase_started = time.time()
+                    log_phase_start(progress_verbose, f"chunk{chunk_index}/checkpoint_save")
+                    if not markets_only:
+                        cp.watermark_trade_ts = max(cp.watermark_trade_ts, chunk_end)
+                    cp.watermark_market_ts = max(cp.watermark_market_ts, chunk_end)
+                    cp.last_successful_run_id = run_id
+                    cp.last_successful_run_started_at = run_started_at
+                    cp.last_successful_run_completed_at = iso_now()
+                    cp.total_trade_rows_written += len(trade_rows_chunk)
+                    cp.total_market_rows_written += len(market_rows_chunk)
+                    cp.save()
+                    log_phase_end(
+                        progress_verbose,
+                        f"chunk{chunk_index}/checkpoint_save",
+                        phase_started,
+                        checkpoint_trade_ts=cp.watermark_trade_ts,
+                        checkpoint_market_ts=cp.watermark_market_ts,
+                    )
+
+                    outputs.append({
+                        "chunk_index": chunk_index,
+                        "window": {"min_exclusive": current_start, "max_inclusive": chunk_end},
+                        "trades_file": str(written_trade_path_chunk) if written_trade_path_chunk else "",
+                        "markets_file": str(written_market_path_chunk) if written_market_path_chunk else "",
+                    })
+                    log.info("Chunk %s complete; checkpoint advanced to %s.", chunk_index, iso_from_epoch(chunk_end))
+
+                current_start = chunk_end
+
+            if not args.dry_run:
+                run_manifest = {
+                    "run_id": run_id,
+                    "started_at": run_started_at,
+                    "completed_at": iso_now(),
+                    "dry_run": args.dry_run,
+                    "historical_only": args.historical_only,
+                    "lookback_seconds": args.lookback_seconds,
+                    "chunk_days": chunk_days,
+                    "chunks": len(outputs),
+                    "upper_bound": {
+                        "ts": upper_bound_ts,
+                        "iso": iso_from_epoch(upper_bound_ts),
+                        "meta": upper_meta,
+                    },
+                    "windows": {
+                        "trade": {"min_exclusive": min_trade_ts, "max_inclusive": upper_bound_ts},
+                        "market": {"min_exclusive": min_market_ts, "max_inclusive": upper_bound_ts},
+                    },
+                    "counts": {
+                        "trade_raw": total_trade_raw,
+                        "trade_written": total_trade_written,
+                        "trade_skipped_dupes": total_skipped_trade_dupes,
+                        "market_raw": total_market_raw,
+                        "market_written": total_market_written,
+                        "market_skipped_dupes": total_skipped_market_dupes,
+                    },
+                    "outputs": outputs,
+                    "client_stats": {
+                        "requests": client.request_count,
+                        "errors": client.error_count,
+                        "rate_limited": client.rate_limit_count,
+                    },
+                }
+                RUN_MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(RUN_MANIFEST_DIR / f"{run_id}.json", run_manifest)
+
+            if args.dry_run:
+                log.info("Dry run complete (chunked). No files or checkpoint were modified.")
+            else:
+                log.info("Run complete (chunked). %s chunk(s); checkpoint advanced to %s.", chunk_index, iso_from_epoch(cp.watermark_trade_ts))
+            return
+
+        # Single-window path (chunk_days == 0)
+        raw_trade_rows: list[dict] = []
+        if not markets_only:
+            phase_started = time.time()
+            log_phase_start(progress_verbose, "single/fetch_trades", min_ts=min_trade_ts, max_ts=upper_bound_ts)
+            raw_trade_rows = fetch_trade_deltas(
+                client=client,
+                min_ts_exclusive=min_trade_ts,
+                max_ts_inclusive=upper_bound_ts,
+                run_id=run_id,
+                max_pages=args.max_trade_pages,
+            )
+            log_phase_end(
+                progress_verbose,
+                "single/fetch_trades",
+                phase_started,
+                rows_raw=len(raw_trade_rows),
+                rows_per_sec=(len(raw_trade_rows) / max(time.time() - phase_started, 1e-6)),
+            )
+        phase_started = time.time()
+        log_phase_start(progress_verbose, "single/fetch_markets", min_ts=min_market_ts, max_ts=upper_bound_ts)
         raw_market_rows = fetch_market_deltas(
             client=client,
             min_ts_exclusive=min_market_ts,
             max_ts_inclusive=upper_bound_ts,
             run_id=run_id,
             max_pages=args.max_market_pages,
+            market_path=market_path,
+            market_slice_hours=float(getattr(args, "market_slice_hours", 0.0) or 0.0),
+            periodic_gc_market_pages=int(getattr(args, "periodic_gc_market_pages", 0) or 0),
+        )
+        log_phase_end(
+            progress_verbose,
+            "single/fetch_markets",
+            phase_started,
+            rows_raw=len(raw_market_rows),
+            rows_per_sec=(len(raw_market_rows) / max(time.time() - phase_started, 1e-6)),
         )
 
-        # Dedupe trades
-        trade_seen: set[str] = set()
         trade_rows: list[dict] = []
-        skipped_trade_dupes = 0
-        for row in raw_trade_rows:
-            trade_id = row.get("trade_id", "")
-            if not trade_id:
-                continue
-            if trade_id in trade_seen or trade_id in existing_trade_ids:
-                skipped_trade_dupes += 1
-                continue
-            trade_seen.add(trade_id)
-            trade_rows.append(row)
+        skipped_trade_dupes_existing = 0
+        skipped_trade_dupes_within = 0
+        if not markets_only:
+            trade_seen: set[str] = set()
+            for row in raw_trade_rows:
+                trade_id = row.get("trade_id", "")
+                if not trade_id:
+                    continue
+                if trade_id in trade_seen:
+                    skipped_trade_dupes_within += 1
+                    continue
+                if trade_id in existing_trade_ids:
+                    skipped_trade_dupes_existing += 1
+                    continue
+                trade_seen.add(trade_id)
+                trade_rows.append(row)
+        skipped_trade_dupes = skipped_trade_dupes_existing + skipped_trade_dupes_within
 
-        # Dedupe markets (within batch and vs existing) so we never write duplicate (ticker, close_time)
         market_seen: set[str] = set()
         market_rows: list[dict] = []
-        skipped_market_dupes = 0
+        skipped_market_dupes_existing = 0
+        skipped_market_dupes_within = 0
         for row in raw_market_rows:
             key = market_key(row)
-            if key in market_seen or key in existing_market_keys:
-                skipped_market_dupes += 1
+            if key in market_seen:
+                skipped_market_dupes_within += 1
+                continue
+            if key in existing_market_keys:
+                skipped_market_dupes_existing += 1
                 continue
             market_seen.add(key)
             market_rows.append(row)
+        skipped_market_dupes = skipped_market_dupes_existing + skipped_market_dupes_within
+        if progress_verbose:
+            log.info(
+                "[phase] single/dedupe summary | trade_dupes_existing=%s trade_dupes_within=%s market_dupes_existing=%s market_dupes_within=%s",
+                f"{skipped_trade_dupes_existing:,}",
+                f"{skipped_trade_dupes_within:,}",
+                f"{skipped_market_dupes_existing:,}",
+                f"{skipped_market_dupes_within:,}",
+            )
 
-        validate_trade_rows(trade_rows)
+        if not markets_only:
+            validate_trade_rows(trade_rows)
         validate_market_rows(market_rows)
 
-        log.info(f"Fetched trades raw:        {len(raw_trade_rows):,}")
-        log.info(f"Trades after dedupe:       {len(trade_rows):,} (skipped {skipped_trade_dupes:,})")
+        if not markets_only:
+            log.info(f"Fetched trades raw:        {len(raw_trade_rows):,}")
+            log.info(f"Trades after dedupe:       {len(trade_rows):,} (skipped {skipped_trade_dupes:,})")
         log.info(f"Fetched markets raw:       {len(raw_market_rows):,}")
         log.info(f"Markets after dedupe:      {len(market_rows):,} (skipped {skipped_market_dupes:,})")
 
@@ -823,15 +1402,17 @@ def run(args: argparse.Namespace):
 
         if not args.dry_run:
             if trade_rows:
+                (FORWARD_TRADES_DIR / f"dt={run_date}").mkdir(parents=True, exist_ok=True)
                 written_trade_path = FORWARD_TRADES_DIR / f"dt={run_date}" / f"trades_{run_id}.parquet"
                 atomic_write_parquet(written_trade_path, trade_rows, schema=TRADE_SCHEMA)
 
             if market_rows:
+                (FORWARD_MARKETS_DIR / f"dt={run_date}").mkdir(parents=True, exist_ok=True)
                 written_market_path = FORWARD_MARKETS_DIR / f"dt={run_date}" / f"markets_{run_id}.parquet"
                 atomic_write_parquet(written_market_path, market_rows, schema=MARKET_SCHEMA)
 
-            # Advance checkpoint only after successful writes
-            cp.watermark_trade_ts = max(cp.watermark_trade_ts, upper_bound_ts)
+            if not markets_only:
+                cp.watermark_trade_ts = max(cp.watermark_trade_ts, upper_bound_ts)
             cp.watermark_market_ts = max(cp.watermark_market_ts, upper_bound_ts)
             cp.last_successful_run_id = run_id
             cp.last_successful_run_started_at = run_started_at
@@ -884,6 +1465,10 @@ def run(args: argparse.Namespace):
             log.info("Run complete and checkpoint advanced.")
 
     finally:
+        if resource_stop_event is not None:
+            resource_stop_event.set()
+        if resource_thread is not None:
+            resource_thread.join(timeout=2.0)
         client.close()
 
 
@@ -898,6 +1483,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--historical-only",
         action="store_true",
         help="Use /historical/cutoff as the run upper bound instead of current time",
+    )
+    parser.add_argument(
+        "--markets-only",
+        action="store_true",
+        help="Fetch/write markets only (do not fetch trades, do not advance trade watermark). Useful for market backfill repairs.",
     )
     parser.add_argument(
         "--lookback-seconds",
@@ -934,6 +1524,40 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional safety cap for market pagination during testing",
+    )
+    parser.add_argument(
+        "--chunk-days",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Process window in N-day chunks: fetch chunk, write Parquet, advance checkpoint, repeat. Resumable if killed. Default 0 = one big run. Use 7 or 14 if you hit OOM (e.g. --chunk-days 7).",
+    )
+    parser.add_argument(
+        "--progress-verbose",
+        action="store_true",
+        help="Log clear phase-by-phase progress with timings and duplicate breakdowns.",
+    )
+    parser.add_argument(
+        "--resource-log-seconds",
+        type=float,
+        default=0.0,
+        metavar="S",
+        help="Log process RAM/CPU every S seconds (0 disables resource logging).",
+    )
+    parser.add_argument(
+        "--periodic-gc-market-pages",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Every N market API pages run gc.collect() (0=off). May slightly reduce RSS on long scans; can add pauses.",
+    )
+    parser.add_argument(
+        "--market-slice-hours",
+        type=float,
+        default=12.0,
+        metavar="H",
+        help="Split each market fetch into API close_ts windows of H hours (new cursor each slice). "
+        "0 = single long pagination (legacy). Does not change --chunk-days. Default: 12.",
     )
     return parser
 
