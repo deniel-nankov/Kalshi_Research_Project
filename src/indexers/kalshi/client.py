@@ -1,12 +1,37 @@
+import base64
+import os
+import time
 from collections.abc import Generator
 from typing import Optional
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
 
 from src.common.client import retry_request
 from src.indexers.kalshi.models import Market, Trade
 
+load_dotenv()
+
 KALSHI_API_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+
+_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+_PRIVATE_KEY_PEM = os.environ.get("KALSHI_API_PRIVATE_KEY", "")
+
+
+def _auth_headers(method: str, path: str) -> dict:
+    if not _API_KEY_ID or not _PRIVATE_KEY_PEM:
+        return {}
+    ts_ms = str(int(time.time() * 1000))
+    msg = (ts_ms + method.upper() + path).encode()
+    private_key = serialization.load_pem_private_key(_PRIVATE_KEY_PEM.encode(), password=None)
+    sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return {
+        "KALSHI-ACCESS-KEY": _API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+    }
 
 
 class KalshiClient:
@@ -26,7 +51,7 @@ class KalshiClient:
     @retry_request()
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         """Make a GET request with retry/backoff."""
-        response = self.client.get(path, params=params)
+        response = self.client.get(path, params=params, headers=_auth_headers("GET", path))
         response.raise_for_status()
         return response.json()
 

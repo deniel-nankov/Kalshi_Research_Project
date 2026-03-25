@@ -38,6 +38,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_ROOT))
 
 import argparse
+import base64
 import gc
 import json
 import logging
@@ -47,7 +48,10 @@ import subprocess
 import threading
 import time
 import uuid
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None  # type: ignore[assignment]  # Windows
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -56,6 +60,11 @@ import duckdb
 import httpx
 import pyarrow as pa
 import pyarrow.parquet as pq
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config (paths from shared module; single place under data/kalshi/historical)
@@ -82,6 +91,30 @@ from src.kalshi_forward.paths import (
     RUN_MANIFEST_DIR,
     STATE_DIR,
 )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Kalshi RSA authentication
+# ──────────────────────────────────────────────────────────────────────────────
+_KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
+_KALSHI_PRIVATE_KEY_PEM = os.environ.get("KALSHI_API_PRIVATE_KEY", "")
+
+
+def _build_auth_headers(method: str, path: str) -> dict:
+    """Return Kalshi RSA auth headers for a request, or empty dict if not configured."""
+    if not _KALSHI_API_KEY_ID or not _KALSHI_PRIVATE_KEY_PEM:
+        return {}
+    ts_ms = str(int(time.time() * 1000))
+    msg = (ts_ms + method.upper() + path).encode()
+    private_key = serialization.load_pem_private_key(
+        _KALSHI_PRIVATE_KEY_PEM.encode(), password=None
+    )
+    sig = private_key.sign(msg, padding.PKCS1v15(), hashes.SHA256())
+    return {
+        "KALSHI-ACCESS-KEY": _KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+    }
+
 
 TRADE_PAGE_LIMIT = 1000
 MARKET_PAGE_LIMIT = 1000
@@ -207,40 +240,71 @@ def log_phase_end(enabled: bool, phase: str, started_at: float, **metrics: Any):
 
 def _read_process_usage(pid: int) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """Return rss_mb, cpu_pct, cpu_time_s for this process (cpu_pct from ps when available)."""
-    try:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        cpu_time_s = usage.ru_utime + usage.ru_stime
-        # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
-        if sys.platform == "darwin":
-            rss_mb = float(usage.ru_maxrss) / (1024.0 * 1024.0)
-        else:
-            rss_mb = float(usage.ru_maxrss) / 1024.0
-    except Exception:
-        rss_mb, cpu_time_s = None, None
-
+    rss_mb: Optional[float] = None
+    cpu_time_s: Optional[float] = None
     cpu_pct: Optional[float] = None
-    try:
-        out = subprocess.check_output(
-            ["ps", "-o", "rss=,%cpu=", "-p", str(pid)],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        ).strip()
-        if out:
-            if "," in out:
-                rss_kb_s, cpu_pct_s = out.split(",", 1)
+
+    if resource is not None:
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            cpu_time_s = usage.ru_utime + usage.ru_stime
+            # macOS: ru_maxrss is bytes; Linux: ru_maxrss is kilobytes
+            if sys.platform == "darwin":
+                rss_mb = float(usage.ru_maxrss) / (1024.0 * 1024.0)
             else:
-                parts = out.split()
-                if len(parts) >= 2:
-                    rss_kb_s, cpu_pct_s = parts[0], parts[1]
+                rss_mb = float(usage.ru_maxrss) / 1024.0
+        except Exception:
+            rss_mb, cpu_time_s = None, None
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            process = kernel32.GetCurrentProcess()
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+            pmc = PROCESS_MEMORY_COUNTERS()
+            pmc.cb = ctypes.sizeof(pmc)
+            psapi = ctypes.windll.psapi
+            if psapi.GetProcessMemoryInfo(process, ctypes.byref(pmc), pmc.cb):
+                rss_mb = pmc.WorkingSetSize / (1024.0 * 1024.0)
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.check_output(
+                ["ps", "-o", "rss=,%cpu=", "-p", str(pid)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).strip()
+            if out:
+                if "," in out:
+                    rss_kb_s, cpu_pct_s = out.split(",", 1)
                 else:
-                    rss_kb_s, cpu_pct_s = "", ""
-            if rss_kb_s.strip():
-                rss_mb = float(rss_kb_s.strip()) / 1024.0
-            if cpu_pct_s.strip():
-                cpu_pct = float(cpu_pct_s.strip())
-    except Exception:
-        pass
+                    parts = out.split()
+                    if len(parts) >= 2:
+                        rss_kb_s, cpu_pct_s = parts[0], parts[1]
+                    else:
+                        rss_kb_s, cpu_pct_s = "", ""
+                if rss_kb_s.strip():
+                    rss_mb = float(rss_kb_s.strip()) / 1024.0
+                if cpu_pct_s.strip():
+                    cpu_pct = float(cpu_pct_s.strip())
+        except Exception:
+            pass
 
     if rss_mb is None and cpu_time_s is None:
         return None, None, None
@@ -385,7 +449,8 @@ class RobustClient:
                 raise RuntimeError("Shutdown requested")
             try:
                 time.sleep(self._delay)
-                response = self.client.get(path, params=params)
+                headers = _build_auth_headers("GET", path)
+                response = self.client.get(path, params=params, headers=headers)
                 self.request_count += 1
 
                 if response.status_code == 429:
