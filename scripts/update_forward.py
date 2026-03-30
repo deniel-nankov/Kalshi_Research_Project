@@ -393,12 +393,33 @@ class ForwardCheckpoint:
         persist_if_created: bool = True,
     ) -> "ForwardCheckpoint":
         if CHECKPOINT_FILE.exists():
-            raw = json.loads(CHECKPOINT_FILE.read_text())
-            cp = cls()
-            for key, value in raw.items():
-                if hasattr(cp, key):
-                    setattr(cp, key, value)
-            return cp
+            text = CHECKPOINT_FILE.read_text()
+            stripped = text.strip()
+            if not stripped:
+                log.warning("Forward checkpoint file is empty; re-bootstrapping.")
+                try:
+                    CHECKPOINT_FILE.unlink()
+                except OSError:
+                    pass
+            else:
+                try:
+                    raw = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    log.warning("Forward checkpoint JSON invalid (%s); re-bootstrapping.", exc)
+                    bad = CHECKPOINT_FILE.with_suffix(f".json.broken.{int(time.time())}")
+                    try:
+                        CHECKPOINT_FILE.rename(bad)
+                    except OSError:
+                        try:
+                            CHECKPOINT_FILE.unlink()
+                        except OSError:
+                            pass
+                else:
+                    cp = cls()
+                    for key, value in raw.items():
+                        if hasattr(cp, key):
+                            setattr(cp, key, value)
+                    return cp
 
         start_ts = 0
         if explicit_start_ts is not None:

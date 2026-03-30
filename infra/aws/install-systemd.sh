@@ -13,6 +13,7 @@ if [[ ! -f /etc/kalshi/forward-exec.env ]]; then
   chmod 644 /etc/kalshi/forward-exec.env
   echo "Created /etc/kalshi/forward-exec.env (edit UPDATE_FORWARD_EXTRA_ARGS if needed)."
 fi
+chmod +x "$ROOT/infra/aws/run-update-forward.sh" 2>/dev/null || true
 cp "$UNIT_DIR/kalshi-forward.service" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-forward.timer" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-health.service" /etc/systemd/system/
