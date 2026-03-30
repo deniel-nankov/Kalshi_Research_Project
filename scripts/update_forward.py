@@ -40,6 +40,7 @@ if str(_SCRIPT_ROOT) not in sys.path:
 import argparse
 import base64
 import gc
+import glob as stdlib_glob
 import json
 import logging
 import os
@@ -687,6 +688,20 @@ def _existing_trade_id_sources() -> list[str]:
     return patterns
 
 
+def _expand_source_specs_to_parquet_files(source_specs: list[str]) -> list[str]:
+    """Turn glob patterns or single paths into concrete parquet file paths."""
+    out: list[str] = []
+    for src in source_specs:
+        if any(ch in src for ch in "*?["):
+            matches = sorted(stdlib_glob.glob(src))
+        else:
+            matches = [src] if os.path.isfile(src) else []
+        for p in matches:
+            if p.endswith(".parquet") and os.path.isfile(p):
+                out.append(p)
+    return out
+
+
 def _existing_market_key_sources() -> list[str]:
     patterns: list[str] = []
     if HISTORICAL_MARKETS_FILE.exists():
@@ -702,23 +717,33 @@ def _existing_market_key_sources() -> list[str]:
 
 def load_existing_trade_ids(window_start_ts: int) -> set[str]:
     sources = _existing_trade_id_sources()
-    if not sources:
+    paths = _expand_source_specs_to_parquet_files(sources)
+    if not paths:
         return set()
 
     window_start_iso = iso_from_epoch(window_start_ts)
     existing: set[str] = set()
     con = duckdb.connect()
     try:
-        for src in sources:
-            query = f"""
-                SELECT DISTINCT trade_id
-                FROM '{src}'
-                WHERE trade_id IS NOT NULL
-                  AND trade_id <> ''
-                  AND TRY_CAST(created_time AS TIMESTAMP) >= TRY_CAST(? AS TIMESTAMP)
-            """
-            rows = con.execute(query, [window_start_iso]).fetchall()
-            existing.update(row[0] for row in rows if row and row[0])
+        for path in paths:
+            try:
+                rows = con.execute(
+                    """
+                    SELECT DISTINCT trade_id
+                    FROM read_parquet(?)
+                    WHERE trade_id IS NOT NULL
+                      AND trade_id <> ''
+                      AND TRY_CAST(created_time AS TIMESTAMP) >= TRY_CAST(? AS TIMESTAMP)
+                    """,
+                    [path, window_start_iso],
+                ).fetchall()
+                existing.update(row[0] for row in rows if row and row[0])
+            except Exception as exc:
+                log.warning(
+                    "Skipping unreadable trade parquet (corrupt, truncated, or Git LFS pointer?): %s — %s",
+                    path,
+                    exc,
+                )
     finally:
         con.close()
 
@@ -735,29 +760,39 @@ def market_key(row: dict) -> str:
 
 def load_existing_market_keys(window_start_ts: int) -> set[str]:
     sources = _existing_market_key_sources()
-    if not sources:
+    paths = _expand_source_specs_to_parquet_files(sources)
+    if not paths:
         return set()
 
     window_start_iso = iso_from_epoch(window_start_ts)
     existing: set[str] = set()
     con = duckdb.connect()
     try:
-        for src in sources:
-            query = f"""
-                SELECT DISTINCT
-                    ticker,
-                                        COALESCE(close_time, created_time, '') AS key_ts
-                FROM '{src}'
-                WHERE ticker IS NOT NULL
-                  AND ticker <> ''
-                  AND COALESCE(
-                                                TRY_CAST(close_time AS TIMESTAMP),
-                        TRY_CAST(created_time AS TIMESTAMP)
-                      ) >= TRY_CAST(? AS TIMESTAMP)
-            """
-            rows = con.execute(query, [window_start_iso]).fetchall()
-            for ticker, key_ts in rows:
-                existing.add(f"{ticker}|{key_ts or ''}")
+        for path in paths:
+            try:
+                rows = con.execute(
+                    """
+                    SELECT DISTINCT
+                        ticker,
+                        COALESCE(close_time, created_time, '') AS key_ts
+                    FROM read_parquet(?)
+                    WHERE ticker IS NOT NULL
+                      AND ticker <> ''
+                      AND COALESCE(
+                            TRY_CAST(close_time AS TIMESTAMP),
+                            TRY_CAST(created_time AS TIMESTAMP)
+                          ) >= TRY_CAST(? AS TIMESTAMP)
+                    """,
+                    [path, window_start_iso],
+                ).fetchall()
+                for ticker, key_ts in rows:
+                    existing.add(f"{ticker}|{key_ts or ''}")
+            except Exception as exc:
+                log.warning(
+                    "Skipping unreadable market parquet (corrupt, truncated, or Git LFS pointer?): %s — %s",
+                    path,
+                    exc,
+                )
     finally:
         con.close()
 

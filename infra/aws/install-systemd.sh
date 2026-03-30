@@ -14,6 +14,7 @@ if [[ ! -f /etc/kalshi/forward-exec.env ]]; then
   echo "Created /etc/kalshi/forward-exec.env (edit UPDATE_FORWARD_EXTRA_ARGS if needed)."
 fi
 chmod +x "$ROOT/infra/aws/run-update-forward.sh" 2>/dev/null || true
+chmod +x "$ROOT/infra/aws/test-pipeline.sh" 2>/dev/null || true
 cp "$UNIT_DIR/kalshi-forward.service" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-forward.timer" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-health.service" /etc/systemd/system/
@@ -23,3 +24,4 @@ systemctl enable --now kalshi-forward.timer
 systemctl enable --now kalshi-health.timer
 echo "Enabled timers. Check: systemctl list-timers | grep kalshi"
 echo "Logs: journalctl -u kalshi-forward.service -f"
+echo "Before relying on timers: sudo -u ubuntu bash $ROOT/infra/aws/test-pipeline.sh"
