@@ -8,9 +8,7 @@ Type=oneshot
 User=ubuntu
 Group=ubuntu
 WorkingDirectory=/opt/kalshi-pipeline
-# Optional: UPDATE_FORWARD_EXTRA_ARGS (e.g. --markets-only). See forward-exec.env.example.
-EnvironmentFile=-/etc/kalshi/forward-exec.env
-# Wrapper avoids systemd interpreting ${...} in ExecStart; logs show script path in journal.
+# Extra args come from /etc/kalshi/forward-exec.env inside run-update-forward.sh (not EnvironmentFile= here).
 ExecStart=/opt/kalshi-pipeline/infra/aws/run-update-forward.sh
 TimeoutStartSec=0
 Nice=5

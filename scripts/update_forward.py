@@ -440,7 +440,11 @@ def _bootstrap_ts_from_historical_checkpoint() -> int:
     if not HISTORICAL_CHECKPOINT_FILE.exists():
         return 0
     try:
-        raw = json.loads(HISTORICAL_CHECKPOINT_FILE.read_text())
+        hist_text = HISTORICAL_CHECKPOINT_FILE.read_text().strip()
+        if not hist_text:
+            log.warning("Historical checkpoint file is empty; using watermark 0.")
+            return 0
+        raw = json.loads(hist_text)
         cutoff_ts = raw.get("cutoff_ts", "")
         if cutoff_ts:
             return parse_iso_to_epoch_seconds(cutoff_ts)
