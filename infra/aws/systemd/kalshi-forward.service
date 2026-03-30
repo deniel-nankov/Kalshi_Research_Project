@@ -1,0 +1,19 @@
+[Unit]
+Description=Kalshi forward ingestion (update_forward.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# Optional: UPDATE_FORWARD_EXTRA_ARGS (e.g. --markets-only). See forward-exec.env.example.
+EnvironmentFile=-/etc/kalshi/forward-exec.env
+# Loads project .env (Kalshi keys). chmod 600, owned by ubuntu.
+ExecStart=/bin/bash -lc 'set -a && [ -f /opt/kalshi-pipeline/.env ] && . /opt/kalshi-pipeline/.env && set +a && exec /usr/local/bin/uv run python scripts/update_forward.py ${UPDATE_FORWARD_EXTRA_ARGS-}'
+TimeoutStartSec=0
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

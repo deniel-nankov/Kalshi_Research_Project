@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Kalshi health check daily
+
+[Timer]
+OnCalendar=*-*-* 06:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
