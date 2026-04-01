@@ -109,6 +109,10 @@ class CheckResult:
     details: dict = field(default_factory=dict)
 
 
+def _progress(msg: str) -> None:
+    print(f"[validate_data_health] {msg}", flush=True)
+
+
 def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
     results: list[CheckResult] = []
     trades_sql = _combined_trades_sql()
@@ -121,7 +125,12 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("DATA_PRESENCE", "FAIL", "No market data found", {}))
         return results
 
+    _progress(
+        "Starting full-dataset DuckDB scans (often 15–90+ min; long silent stretches are normal) …"
+    )
+
     # ─── 1. Schema & required columns ──────────────────────────────────────
+    _progress("1/9 schema …")
     try:
         trade_cols = set(con.execute(f"DESCRIBE SELECT * FROM ({trades_sql}) LIMIT 1").fetchdf()["column_name"])
         required = {"trade_id", "ticker", "created_time"}
@@ -143,6 +152,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("SCHEMA_MARKETS", "FAIL", str(e), {}))
 
     # ─── 2. Uniqueness (trade_id, market keys) ───────────────────────────────
+    _progress("2/9 uniqueness (full COUNT / DISTINCT — slow) …")
     try:
         trade_total = con.execute(f"SELECT COUNT(*) FROM ({trades_sql})").fetchone()[0]
         trade_distinct = con.execute(f"SELECT COUNT(DISTINCT trade_id) FROM ({trades_sql}) WHERE trade_id IS NOT NULL AND trade_id <> ''").fetchone()[0]
@@ -168,6 +178,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("UNIQUENESS_MARKETS", "FAIL", str(e), {}))
 
     # ─── 3. Referential integrity (trades.ticker in markets) ─────────────────
+    _progress("3/9 referential integrity …")
     try:
         orphan = con.execute(
             f"""
@@ -188,6 +199,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("REFERENTIAL_INTEGRITY", "WARN", f"Check skipped: {e}", {}))
 
     # ─── 4. Temporal consistency (parseable, no future) ──────────────────────
+    _progress("4/9 temporal consistency …")
     try:
         trade_null_ts = con.execute(f"SELECT COUNT(*) FROM ({trades_sql}) WHERE created_time IS NULL OR TRIM(created_time) = ''").fetchone()[0]
         trade_parse_fail = con.execute(
@@ -208,6 +220,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("TEMPORAL_TRADES", "FAIL", str(e), {}))
 
     # ─── 5. Value constraints (prices 0–100) ────────────────────────────────
+    _progress("5/9 value constraints …")
     try:
         trade_bad_price = con.execute(
             f"SELECT COUNT(*) FROM ({trades_sql}) WHERE yes_price < 0 OR yes_price > 100 OR no_price < 0 OR no_price > 100"
@@ -225,6 +238,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("VALUE_CONSTRAINTS_TRADES", "WARN", f"Check skipped: {e}", {}))
 
     # ─── 6. Boundary alignment (max trade <= API cutoff) ──────────────────────
+    _progress("6/9 boundary alignment (API) …")
     try:
         import urllib.request
         from src.kalshi_forward.paths import CUTOFF_URL
@@ -259,6 +273,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("BOUNDARY_ALIGNMENT", "WARN", str(e), {}))
 
     # ─── 7. Historical/forward overlap (no duplicate trade_ids) ──────────────
+    _progress("7/9 boundary overlap …")
     try:
         fwd_srcs = _forward_trade_sources()
         if _has_glob(HISTORICAL_TRADES_GLOB) and fwd_srcs:
@@ -286,6 +301,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("BOUNDARY_OVERLAP", "WARN", str(e), {}))
 
     # ─── 7a. Boundary gap (no big time skip between historical and forward) ───
+    _progress("7a boundary gap …")
     try:
         fwd_srcs = _forward_trade_sources()
         if _has_glob(HISTORICAL_TRADES_GLOB) and fwd_srcs:
@@ -336,6 +352,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("BOUNDARY_GAP", "WARN", str(e), {}))
 
     # ─── 7b. Trade timeline density (gaps between consecutive days: no big skip) ───
+    _progress("7b trade timeline density (heavy scan) …")
     try:
         if trades_sql:
             # Use daily boundaries (fast): max gap from end of one day to start of next
@@ -396,6 +413,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("TRADE_TIMELINE_DENSITY", "WARN", str(e), {}))
 
     # ─── 7c. Forward-only count=0 (prevention: catch API/schema regression) ───
+    _progress("7c forward count completeness …")
     try:
         fwd_srcs = _forward_trade_sources()
         if fwd_srcs:
@@ -417,6 +435,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("FORWARD_COUNT_COMPLETENESS", "WARN", str(e), {}))
 
     # ─── 8. Completeness & coverage ─────────────────────────────────────────
+    _progress("8/9 completeness …")
     try:
         trade_total = con.execute(f"SELECT COUNT(*) FROM ({trades_sql})").fetchone()[0]
         market_total = con.execute(f"SELECT COUNT(*) FROM ({markets_sql})").fetchone()[0]
@@ -434,6 +453,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         results.append(CheckResult("COMPLETENESS", "FAIL", str(e), {}))
 
     # ─── 9. Statistical sanity (volume skew is expected for headline markets) ───
+    _progress("9/9 statistical sanity …")
     try:
         vol_p99 = con.execute(f"SELECT quantile_cont(volume, 0.99) FROM ({markets_sql}) WHERE volume IS NOT NULL").fetchone()[0]
         vol_max = con.execute(f"SELECT MAX(volume) FROM ({markets_sql})").fetchone()[0]
