@@ -6,6 +6,7 @@ Server preflight: verify .env keys present, Parquet under data/kalshi are real f
 Usage (on EC2, repo root):
   uv run python scripts/preflight_ec2_pipeline.py
   uv run python scripts/preflight_ec2_pipeline.py --strict   # exit 1 if any bad file
+  uv run python scripts/preflight_ec2_pipeline.py --strict --skip-api-keys   # Parquet-only (no .env)
 """
 
 from __future__ import annotations
@@ -75,6 +76,11 @@ def main() -> int:
 
     p = argparse.ArgumentParser(description="EC2 / server pipeline preflight")
     p.add_argument("--strict", action="store_true", help="Exit 1 if any parquet fails")
+    p.add_argument(
+        "--skip-api-keys",
+        action="store_true",
+        help="Do not require KALSHI_API_* in .env (use for data health / offline validation only)",
+    )
     args = p.parse_args()
 
     print("=" * 72)
@@ -85,9 +91,17 @@ def main() -> int:
     kid = os.environ.get("KALSHI_API_KEY_ID", "").strip()
     pk = os.environ.get("KALSHI_API_PRIVATE_KEY", "").strip()
     if not kid or not pk:
-        print("FAIL: KALSHI_API_KEY_ID and/or KALSHI_API_PRIVATE_KEY missing from environment (.env)")
-        return 1
-    print(f"OK: API key id present ({len(kid)} chars), private key material present ({len(pk)} chars)")
+        if args.skip_api_keys:
+            print(
+                "WARN: KALSHI_API_KEY_ID / KALSHI_API_PRIVATE_KEY missing — skipping API check "
+                "(--skip-api-keys; fine for Parquet validation, not for update_forward)"
+            )
+        else:
+            print("FAIL: KALSHI_API_KEY_ID and/or KALSHI_API_PRIVATE_KEY missing from environment (.env)")
+            print("      For data-only checks: add .env or pass --skip-api-keys")
+            return 1
+    else:
+        print(f"OK: API key id present ({len(kid)} chars), private key material present ({len(pk)} chars)")
 
     print("\n--- JSON metadata ---")
     _check_json_optional(HISTORICAL_CHECKPOINT_FILE, "historical .checkpoint.json")
