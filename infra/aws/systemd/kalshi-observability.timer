@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Kalshi Tier 2 observability after the daily health report
+
+[Timer]
+OnCalendar=*-*-* 06:25:00
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

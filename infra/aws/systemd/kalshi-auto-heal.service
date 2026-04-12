@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi guarded auto-heal (incremental orphan backfill when enabled)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+EnvironmentFile=-/etc/kalshi/auto-heal.env
+ExecStartPre=/bin/install -d -m 755 -o ubuntu -g ubuntu /opt/kalshi-pipeline/data/kalshi/state
+ExecStart=/bin/bash -lc 'set -a && [ -f /opt/kalshi-pipeline/.env ] && . /opt/kalshi-pipeline/.env && [ -f /etc/kalshi/auto-heal.env ] && . /etc/kalshi/auto-heal.env && set +a && exec /usr/local/bin/uv run python scripts/auto_heal_guarded.py'
+TimeoutStartSec=0
+Nice=15
+
+[Install]
+WantedBy=multi-user.target

@@ -23,5 +23,6 @@ fi
 
 echo ""
 echo "=== PREFLIGHT OK ==="
+echo "Full pre-deploy rehearsal (no S3 / no timer changes): bash $ROOT/infra/aws/deploy_dry_run.sh"
 echo "Enable production timers (if not already): sudo bash $ROOT/infra/aws/install-systemd.sh"
 echo "Then: sudo systemctl start kalshi-forward.service"

@@ -45,6 +45,7 @@ from src.kalshi_forward.terminal_report import (
     blank,
     bullet_list,
     err,
+    failure_recovery,
     format_bytes,
     kv_table,
     notice,
@@ -54,6 +55,55 @@ from src.kalshi_forward.terminal_report import (
     utc_now_iso,
     warn,
 )
+
+
+def _recovery_for_step(title: str) -> None:
+    """After a non-zero exit, tell the operator what likely broke and what to run next."""
+    if "dedupe forward trades" in title.lower():
+        failure_recovery(
+            f"Orchestrator step failed: {title}",
+            [
+                "Scroll up for the child script output; search for MILESTONE and === FAILURE === lines.",
+                "If the last MILESTONE was before BACKUP_PHASE_START: your original Parquet was not rewritten; fix the error and re-run trades dedupe only.",
+                "If failure was during BACKUP_PHASE / rewrite_file_*: check data/kalshi/historical/forward_trades_pre_dedupe_* for backups before changing live files.",
+                "Retry trades only: uv run python scripts/dedupe_forward_trades.py --yes --ignore-lock --no-export-memory-limit "
+                "[--copy-chunk-rows 8000000] [--copy-compression uncompressed]",
+                "Or full orchestrator: uv run python scripts/run_institutional_data_repair.py --apply --health-strict "
+                "--trades-no-export-memory-limit --trades-copy-compression uncompressed [--trades-copy-chunk-rows 8000000]",
+                "Full runbook: docs/DATA_REPAIR.md",
+            ],
+        )
+    elif "dedupe forward markets" in title.lower():
+        failure_recovery(
+            f"Orchestrator step failed: {title}",
+            [
+                "Forward trades step may have completed; check output above.",
+                "Retry markets only: uv run python scripts/dedupe_forward_markets.py --yes --ignore-lock",
+                "docs/DATA_REPAIR.md",
+            ],
+        )
+    elif "validate_forward_pipeline" in title.lower() or "forward pipeline" in title.lower():
+        failure_recovery(
+            f"Orchestrator step failed: {title}",
+            [
+                "Dedupe may have finished; this step audits overlap/duplicates.",
+                "Run manually: uv run python scripts/validate_forward_pipeline.py --skip-run",
+            ],
+        )
+    elif "validate_data_health" in title.lower() or "data health" in title.lower():
+        failure_recovery(
+            f"Orchestrator step failed: {title}",
+            [
+                "Open the JSON path printed above (or data/kalshi/state/health_report_post_repair.json).",
+                "FAIL rows need fixing; WARN rows (e.g. orphans) are documented in docs/HEALTH_REPORT_WARNINGS_EXAMINED.md.",
+                "Re-run health only: uv run python scripts/validate_data_health.py --strict --output data/kalshi/state/health_report_post_repair.json",
+            ],
+        )
+    else:
+        failure_recovery(
+            f"Orchestrator step failed: {title}",
+            ["See output above.", "docs/DATA_REPAIR.md"],
+        )
 
 
 def _run_step(title: str, cmd: list[str], *, cwd: Path) -> int:
@@ -70,6 +120,7 @@ def _run_step(title: str, cmd: list[str], *, cwd: Path) -> int:
     print()
     if rc != 0:
         err(f"Step exited with code {rc}: {' '.join(cmd)}")
+        _recovery_for_step(title)
     else:
         success(f"Step completed (exit 0): {title}")
     return rc
@@ -95,6 +146,36 @@ def main() -> int:
         "--orphan-dry-run",
         action="store_true",
         help="After other steps, run fix_orphan_tickers.py --dry-run (may take time: distinct orphan query)",
+    )
+    parser.add_argument(
+        "--health-strict",
+        action="store_true",
+        help="When running validate_data_health.py, pass --strict (exit 1 on any FAIL)",
+    )
+    parser.add_argument(
+        "--health-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write validate_data_health JSON to this path (default: data/kalshi/state/health_report_post_repair.json)",
+    )
+    parser.add_argument(
+        "--trades-no-export-memory-limit",
+        action="store_true",
+        help="Forward to dedupe_forward_trades.py: RESET memory_limit for COPY (use if SET ...GB still OOMs)",
+    )
+    parser.add_argument(
+        "--trades-copy-compression",
+        choices=("snappy", "zstd", "uncompressed"),
+        default="snappy",
+        help="Forward to dedupe_forward_trades.py Parquet COPY codec (uncompressed uses less RAM than zstd)",
+    )
+    parser.add_argument(
+        "--trades-copy-chunk-rows",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Forward to dedupe_forward_trades.py --copy-chunk-rows (0 = disabled; try 8000000 if COPY OOMs)",
     )
     args = parser.parse_args()
 
@@ -171,14 +252,32 @@ def main() -> int:
 
     # ─── Apply dedupe ────────────────────────────────────────────────────────
     banner("APPLY PHASE — deduplication", "This rewrites existing Parquet files; backups are created alongside.")
+    notice("Apply order (each step prints its own MILESTONE lines):")
+    bullet_list(
+        [
+            "1) dedupe_forward_trades.py --yes (long: global window + rewrite Parquet)",
+            "2) dedupe_forward_markets.py --yes",
+            "3) validate_forward_pipeline.py --skip-run",
+            "4) validate_data_health.py (if not --skip-full-health)",
+        ]
+    )
+    blank()
+    _flush()
+    trades_apply = [
+        py,
+        str(cwd / "scripts" / "dedupe_forward_trades.py"),
+        "--yes",
+        "--ignore-lock",
+        "--copy-compression",
+        args.trades_copy_compression,
+    ]
+    if args.trades_no_export_memory_limit:
+        trades_apply.append("--no-export-memory-limit")
+    if int(args.trades_copy_chunk_rows or 0) >= 100_000:
+        trades_apply.extend(["--copy-chunk-rows", str(int(args.trades_copy_chunk_rows))])
     rc = _run_step(
         "APPLY — dedupe forward trades",
-        [
-            py,
-            str(cwd / "scripts" / "dedupe_forward_trades.py"),
-            "--yes",
-            "--ignore-lock",
-        ],
+        trades_apply,
         cwd=cwd,
     )
     if rc != 0:
@@ -202,9 +301,16 @@ def main() -> int:
         warn("Non-zero exit from validate_forward_pipeline; review output above.")
 
     if not args.skip_full_health:
+        health_cmd = [py, str(cwd / "scripts" / "validate_data_health.py")]
+        out = args.health_output
+        if out is None:
+            out = cwd / "data" / "kalshi" / "state" / "health_report_post_repair.json"
+        health_cmd.extend(["--output", str(out)])
+        if args.health_strict:
+            health_cmd.append("--strict")
         rc = _run_step(
             "VALIDATION — full data health report (long on large data)",
-            [py, str(cwd / "scripts" / "validate_data_health.py")],
+            health_cmd,
             cwd=cwd,
         )
         if rc != 0:

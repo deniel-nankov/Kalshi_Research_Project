@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi ops snapshot daemon (headless JSON for S3 / dashboards)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+EnvironmentFile=-/etc/kalshi/ops-console.env
+ExecStart=/bin/bash /opt/kalshi-pipeline/infra/aws/run-ops-console-daemon.sh
+Restart=always
+RestartSec=15
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

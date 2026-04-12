@@ -1,0 +1,18 @@
+[Unit]
+Description=Kalshi Tier 2 — publish health metrics to CloudWatch (and optional S3 snapshot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+EnvironmentFile=-/etc/kalshi/observability.env
+ExecStartPre=/bin/install -d -m 755 -o ubuntu -g ubuntu /opt/kalshi-pipeline/data/kalshi/state
+ExecStart=/bin/bash -lc 'set -a && [ -f /opt/kalshi-pipeline/.env ] && . /opt/kalshi-pipeline/.env && [ -f /etc/kalshi/observability.env ] && . /etc/kalshi/observability.env && set +a && exec /usr/local/bin/uv run python scripts/publish_tier2_observability.py'
+TimeoutStartSec=0
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

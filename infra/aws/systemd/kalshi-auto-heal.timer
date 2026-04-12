@@ -1,0 +1,10 @@
+[Unit]
+Description=Run guarded auto-heal weekly (after health + observability pattern)
+
+[Timer]
+OnCalendar=Sun *-*-* 07:45:00
+AccuracySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

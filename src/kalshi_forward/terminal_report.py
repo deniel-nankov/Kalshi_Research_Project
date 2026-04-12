@@ -40,12 +40,53 @@ def _red(s: str) -> str:
 WIDTH = 80
 
 
+def _unicode_safe_stdout() -> bool:
+    """Box-drawing and checkmark chars need UTF-8 (or wide char support); cp1252 often fails."""
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    if enc in ("utf-8", "utf8"):
+        return True
+    try:
+        "╔✓".encode(enc or "ascii")
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _safe_for_console(s: str) -> str:
+    """Replace unencodable chars (e.g. → on cp1252) so print() never raises UnicodeEncodeError."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        s.encode(enc)
+        return s
+    except (UnicodeEncodeError, LookupError):
+        return s.encode(enc, errors="replace").decode(enc)
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def hline(char: str = "─", width: int = WIDTH) -> None:
-    print(char * width)
+def milestone(code: str, detail: str) -> None:
+    """Single-line progress marker for logs: easy to grep (MILESTONE ...)."""
+    line = f"[{utc_now_iso()}] MILESTONE {code} | {_safe_for_console(detail)}"
+    print(line)
+    sys.stdout.flush()
+
+
+def failure_recovery(what_failed: str, steps: Sequence[str]) -> None:
+    """Print a block the operator can paste when reporting an incident."""
+    blank()
+    print(_red("=== FAILURE - READ THIS BLOCK ==="))
+    print(_dim(_safe_for_console(what_failed)))
+    for i, step in enumerate(steps, 1):
+        print(f"  {i}. {_safe_for_console(step)}")
+    blank()
+    sys.stdout.flush()
+
+
+def hline(char: str | None = None, width: int = WIDTH) -> None:
+    c = char if char is not None else ("─" if _unicode_safe_stdout() else "-")
+    print(c * width)
 
 
 def blank() -> None:
@@ -54,18 +95,25 @@ def blank() -> None:
 
 def banner(title: str, subtitle: str | None = None, *, variant: str = "double") -> None:
     """Print a prominent section header."""
-    top = "╔" + "═" * (WIDTH - 2) + "╗" if variant == "double" else "┌" + "─" * (WIDTH - 2) + "┐"
-    mid = "║" if variant == "double" else "│"
-    bot = "╚" + "═" * (WIDTH - 2) + "╝" if variant == "double" else "└" + "─" * (WIDTH - 2) + "┘"
+    u = _unicode_safe_stdout()
+    if u:
+        top = "╔" + "═" * (WIDTH - 2) + "╗" if variant == "double" else "┌" + "─" * (WIDTH - 2) + "┐"
+        mid = "║" if variant == "double" else "│"
+        bot = "╚" + "═" * (WIDTH - 2) + "╝" if variant == "double" else "└" + "─" * (WIDTH - 2) + "┘"
+    else:
+        top = "+" + "-" * (WIDTH - 2) + "+"
+        mid = "|"
+        bot = "+" + "-" * (WIDTH - 2) + "+"
     print()
     print(top)
     t = title.upper()
+    ell = "..." if not u else "…"
     if len(t) > WIDTH - 6:
-        t = t[: WIDTH - 9] + "…"
+        t = t[: WIDTH - 9] + ell
     inner = f" {t} "
     print(f"{mid}{inner:^{WIDTH - 2}}{mid}")
     if subtitle:
-        st = subtitle if len(subtitle) <= WIDTH - 6 else subtitle[: WIDTH - 9] + "…"
+        st = subtitle if len(subtitle) <= WIDTH - 6 else subtitle[: WIDTH - 9] + ell
         print(f"{mid}  {_dim(st)}{mid}")
     print(bot)
 
@@ -73,9 +121,9 @@ def banner(title: str, subtitle: str | None = None, *, variant: str = "double") 
 def simple_banner(title: str) -> None:
     """Single-line emphasized header."""
     blank()
-    hline("═")
+    hline("═" if _unicode_safe_stdout() else "=")
     print(_bold(f"  {title}"))
-    hline("═")
+    hline("═" if _unicode_safe_stdout() else "=")
 
 
 def kv_table(
@@ -108,19 +156,23 @@ def kv_table(
 
 
 def notice(msg: str) -> None:
-    print(f"  {_bold('•')} {msg}")
+    b = "*" if not _unicode_safe_stdout() else "•"
+    print(f"  {_bold(b)} {msg}")
 
 
 def success(msg: str) -> None:
-    print(f"  {_green('✓')} {msg}")
+    mark = "[OK]" if not _unicode_safe_stdout() else _green("✓")
+    print(f"  {mark} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"  {_yellow('!')} {msg}")
+    mark = "[!]" if not _unicode_safe_stdout() else _yellow("!")
+    print(f"  {mark} {msg}")
 
 
 def err(msg: str) -> None:
-    print(f"  {_red('✗')} {msg}")
+    mark = "[X]" if not _unicode_safe_stdout() else _red("✗")
+    print(f"  {mark} {msg}")
 
 
 def preflight_disk(data_path: Path) -> tuple[int, int]:
@@ -141,12 +193,14 @@ def format_bytes(n: int) -> str:
 
 
 def bullet_list(items: Iterable[str], indent: str = "  ") -> None:
+    b = "*" if not _unicode_safe_stdout() else "•"
     for item in items:
-        print(f"{indent}{_bold('•')} {item}")
+        print(f"{indent}{_bold(b)} {item}")
 
 
 def phase(n: int, name: str, detail: str | None = None) -> None:
     blank()
-    print(_bold(f"── PHASE {n}: {name} ──"))
+    sep = "--" if not _unicode_safe_stdout() else "──"
+    print(_bold(f"{sep} PHASE {n}: {_safe_for_console(name)} {sep}"))
     if detail:
-        print(_dim(f"   {detail}"))
+        print(_dim(f"   {_safe_for_console(detail)}"))

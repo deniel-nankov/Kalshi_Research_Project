@@ -171,7 +171,14 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
         ).fetchone()[0]
         market_dupes = market_total - market_distinct
         if market_dupes > 0:
-            results.append(CheckResult("UNIQUENESS_MARKETS", "WARN", f"Duplicate market keys: {market_dupes:,} (expected for same ticker at different times)", {"total": market_total, "distinct": market_distinct}))
+            results.append(
+                CheckResult(
+                    "UNIQUENESS_MARKETS",
+                    "WARN",
+                    f"Duplicate market keys: {market_dupes:,} extra rows for same (ticker, close_time) — overlapping runs or re-fetches",
+                    {"total": market_total, "distinct": market_distinct},
+                )
+            )
         else:
             results.append(CheckResult("UNIQUENESS_MARKETS", "PASS", f"All {market_total:,} market keys unique", {"total": market_total}))
     except Exception as e:
@@ -237,25 +244,81 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
     except Exception as e:
         results.append(CheckResult("VALUE_CONSTRAINTS_TRADES", "WARN", f"Check skipped: {e}", {}))
 
-    # ─── 6. Boundary alignment (max trade <= API cutoff) ──────────────────────
+    # ─── 6. Boundary alignment (historical max trade vs API cutoff) ─────────────
+    # API trades_created_ts is the historical bundle boundary. Forward data *should*
+    # extend past that; comparing MAX(all trades) to cutoff would false-FAIL. Only
+    # historical Parquet under trades/*.parquet is compared to the cutoff.
     _progress("6/9 boundary alignment (API) …")
     try:
         import urllib.request
         from src.kalshi_forward.paths import CUTOFF_URL
-        hist_max = con.execute(f"SELECT MAX(TRY_CAST(created_time AS TIMESTAMP)) FROM ({trades_sql})").fetchone()[0]
+        all_max = con.execute(f"SELECT MAX(TRY_CAST(created_time AS TIMESTAMP)) FROM ({trades_sql})").fetchone()[0]
+        historical_max = None
+        if _has_glob(HISTORICAL_TRADES_GLOB):
+            historical_max = con.execute(
+                f"SELECT MAX(TRY_CAST(created_time AS TIMESTAMP)) FROM '{HISTORICAL_TRADES_GLOB}'"
+            ).fetchone()[0]
         try:
             req = urllib.request.Request(CUTOFF_URL)
             with urllib.request.urlopen(req, timeout=15) as resp:
                 cutoff_data = json.loads(resp.read().decode())
             cutoff_ts = cutoff_data.get("trades_created_ts", "")
-            if cutoff_ts and hist_max:
+            if cutoff_ts and (historical_max is not None or all_max):
                 cutoff_dt = con.execute("SELECT TRY_CAST(? AS TIMESTAMP)", [cutoff_ts]).fetchone()[0]
-                if cutoff_dt and hist_max > cutoff_dt:
-                    results.append(CheckResult("BOUNDARY_ALIGNMENT", "FAIL", "Max trade exceeds API cutoff", {"max": str(hist_max), "cutoff": cutoff_ts}))
+                if historical_max is not None and cutoff_dt:
+                    if historical_max > cutoff_dt:
+                        results.append(
+                            CheckResult(
+                                "BOUNDARY_ALIGNMENT",
+                                "FAIL",
+                                "Historical max trade time exceeds API cutoff (stale historical download or API regression)",
+                                {
+                                    "historical_max": str(historical_max),
+                                    "all_trades_max": str(all_max),
+                                    "cutoff": cutoff_ts,
+                                },
+                            )
+                        )
+                    else:
+                        results.append(
+                            CheckResult(
+                                "BOUNDARY_ALIGNMENT",
+                                "PASS",
+                                "Historical trades within API cutoff; forward may extend past cutoff",
+                                {
+                                    "historical_max": str(historical_max),
+                                    "all_trades_max": str(all_max),
+                                    "cutoff": cutoff_ts,
+                                },
+                            )
+                        )
+                elif historical_max is None:
+                    results.append(
+                        CheckResult(
+                            "BOUNDARY_ALIGNMENT",
+                            "WARN",
+                            "No historical trades/*.parquet; cannot compare API cutoff to historical bundle",
+                            {"all_trades_max": str(all_max), "cutoff": cutoff_ts},
+                        )
+                    )
                 else:
-                    results.append(CheckResult("BOUNDARY_ALIGNMENT", "PASS", "Data within API cutoff", {"max": str(hist_max), "cutoff": cutoff_ts}))
+                    results.append(
+                        CheckResult(
+                            "BOUNDARY_ALIGNMENT",
+                            "WARN",
+                            "Could not verify against API cutoff",
+                            {"historical_max": str(historical_max), "all_trades_max": str(all_max)},
+                        )
+                    )
             else:
-                results.append(CheckResult("BOUNDARY_ALIGNMENT", "WARN", "Could not verify against API cutoff", {"max": str(hist_max)}))
+                results.append(
+                    CheckResult(
+                        "BOUNDARY_ALIGNMENT",
+                        "WARN",
+                        "Could not verify against API cutoff",
+                        {"historical_max": str(historical_max), "all_trades_max": str(all_max)},
+                    )
+                )
         except Exception as api_err:
             err_str = str(api_err)
             if "403" in err_str or "Forbidden" in err_str:
@@ -264,11 +327,18 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
                         "BOUNDARY_ALIGNMENT",
                         "WARN",
                         "Skipped (API unreachable: 403 Forbidden — network/proxy/VPN?)",
-                        {"max": str(hist_max)},
+                        {"historical_max": str(historical_max), "all_trades_max": str(all_max)},
                     )
                 )
             else:
-                results.append(CheckResult("BOUNDARY_ALIGNMENT", "WARN", f"API cutoff fetch failed: {api_err}", {"max": str(hist_max)}))
+                results.append(
+                    CheckResult(
+                        "BOUNDARY_ALIGNMENT",
+                        "WARN",
+                        f"API cutoff fetch failed: {api_err}",
+                        {"historical_max": str(historical_max), "all_trades_max": str(all_max)},
+                    )
+                )
     except Exception as e:
         results.append(CheckResult("BOUNDARY_ALIGNMENT", "WARN", str(e), {}))
 
@@ -463,7 +533,7 @@ def run_checks(con: duckdb.DuckDBPyConnection) -> list[CheckResult]:
             CheckResult(
                 "STATISTICAL_SANITY",
                 "WARN" if strict_outlier else "PASS",
-                f"Market volume: max={vol_max:,}, p99≈{vol_p99:,}" if vol_max else "No volume data",
+                f"Market volume: max={vol_max:,}, p99~{vol_p99:,}" if vol_max else "No volume data",
                 {"max_volume": vol_max, "p99_volume": vol_p99},
             )
         )
@@ -497,7 +567,11 @@ def main() -> int:
         },
     }
 
-    # Print human-readable
+    if args.output:
+        args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print(f"Report written to {args.output}")
+
+    # ASCII markers so Windows cp1252 consoles never crash on Unicode icons
     print("=" * 72)
     print("KALSHI DATA HEALTH REPORT")
     print("=" * 72)
@@ -505,16 +579,12 @@ def main() -> int:
     print(f"Summary:  {report['summary']['pass']} PASS  |  {report['summary']['warn']} WARN  |  {report['summary']['fail']} FAIL")
     print("-" * 72)
     for r in results:
-        icon = "✓" if r.status == "PASS" else "⚠" if r.status == "WARN" else "✗"
-        print(f"  {icon} {r.name}: {r.message}")
+        tag = "[PASS]" if r.status == "PASS" else "[WARN]" if r.status == "WARN" else "[FAIL]"
+        print(f"  {tag} {r.name}: {r.message}")
         if r.details:
             for k, v in r.details.items():
                 print(f"      {k}: {v}")
     print("=" * 72)
-
-    if args.output:
-        args.output.write_text(json.dumps(report, indent=2))
-        print(f"Report written to {args.output}")
 
     if args.strict and report["summary"]["fail"] > 0:
         return 1

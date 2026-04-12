@@ -1,0 +1,24 @@
+Tracking the institutional ops console from AWS
+===============================================
+
+1) Live JSON in S3 (simplest)
+   - On EC2 after install-systemd.sh: kalshi-ops-console.service runs the headless daemon
+     (infra/aws/run-ops-console-daemon.sh) and refreshes data/kalshi/state/ops_snapshot.json every OPS_CONSOLE_INTERVAL seconds.
+   - Interactive host: uv run python scripts/institutional_ops_console.py
+   - Set UPLOAD_OPS_SNAPSHOT=1 in /etc/kalshi/observability.env so publish_tier2_observability.py
+     also uploads ops_snapshot.json under the same dated S3 prefix as health_report.json.
+
+2) CloudWatch Metrics (already Tier 2)
+   - Namespace KalshiData (or CLOUDWATCH_NAMESPACE): orphan counts, pass/warn/fail, etc.
+
+3) CloudWatch Logs (streaming terminal-style lines)
+   - Run the ops console with a log file, e.g.:
+       uv run python scripts/institutional_ops_console.py --log-file /var/log/kalshi/ops_console.log
+   - Install Amazon CloudWatch Agent on the EC2 host and add a logs collection for that path
+     to log group e.g. /kalshi/ops-console (see AWS docs: "Install CloudWatch Agent on EC2").
+   - IAM: logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents on the log group ARN.
+
+4) systemd journal
+   - journalctl -u kalshi-forward.service -f
+   - Optional: CloudWatch agent "collect_list" for /var/log/journal or use aws logs create-log-stream
+     from a small cron that pushes excerpts (heavier than 1-3).

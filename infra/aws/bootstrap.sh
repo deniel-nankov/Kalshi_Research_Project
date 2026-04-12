@@ -5,7 +5,7 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y git curl ca-certificates build-essential
+apt-get install -y git curl ca-certificates build-essential awscli
 
 export UV_INSTALL_DIR=/usr/local/bin
 curl -LsSf https://astral.sh/uv/install.sh | sh

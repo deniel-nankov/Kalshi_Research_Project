@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
+# ruff: noqa: E402
 """
 Fix REFERENTIAL_INTEGRITY: fetch missing markets for orphan tickers (tickers that
-appear in trades but not in markets) via GET /markets/{ticker} and append to
-forward_markets. Very visible progress.
+appear in trades but not in markets) via Kalshi APIs and append to forward_markets.
+For each ticker we try GET /markets/{ticker} (live), then on 404 GET /historical/markets/{ticker}
+(archived markets). Rows are always real API payloads — no synthetic placeholders.
 
 Usage:
   uv run python scripts/fix_orphan_tickers.py --dry-run   # list orphans only
   uv run python scripts/fix_orphan_tickers.py             # fetch and append (with progress)
   uv run python scripts/fix_orphan_tickers.py --delay 0.3  # delay between API calls (default 0.2)
   uv run python scripts/fix_orphan_tickers.py --max 5000  # cap this run (large sets need many runs)
+  uv run python scripts/fix_orphan_tickers.py --max 10000 --repeat-until-done  # batch until no orphans left
   uv run python scripts/fix_orphan_tickers.py --checkpoint data/kalshi/state/orphan_backfill_checkpoint.txt
+  uv run python scripts/fix_orphan_tickers.py --ignore-checkpoint --max 10000 ...   # re-probe after logic upgrade
+
+Checkpoint always resumes from the latest lines in --checkpoint (append-only). Only one API run at a time:
+  data/kalshi/state/orphan_backfill.lock (use --ignore-orphan-lock if stale after a crash).
+
+Full-screen ops console (streams all stdout + checkpoint/lock polling):
+  uv run python scripts/orphan_backfill_dashboard.py -- --max 10000 --delay 0.2 --checkpoint data/kalshi/state/orphan_backfill_checkpoint.txt --repeat-until-done
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
+import os
 import sys
 import time
+from urllib.parse import quote
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,11 +47,15 @@ from src.kalshi_forward.paths import (
     FORWARD_MARKETS_GLOB,
     FORWARD_TRADES_GLOB,
     HISTORICAL_MARKETS_FILE,
+    HISTORICAL_MARKETS_PATH,
     HISTORICAL_TRADES_GLOB,
     LEGACY_FORWARD_MARKETS_GLOB,
     LEGACY_FORWARD_TRADES_GLOB,
     PROJECT_ROOT,
+    STATE_DIR,
 )
+
+ORPHAN_BACKFILL_LOCK = STATE_DIR / "orphan_backfill.lock"
 
 
 def _load_update_forward():
@@ -54,14 +71,14 @@ def _load_update_forward():
 
 
 def _log(msg: str) -> None:
-    print(f"  {msg}")
+    print(f"  {msg}", flush=True)
 
 
 def _section(title: str) -> None:
-    print()
-    print("=" * 72)
-    print(f"  {title}")
-    print("=" * 72)
+    print(flush=True)
+    print("=" * 72, flush=True)
+    print(f"  {title}", flush=True)
+    print("=" * 72, flush=True)
 
 
 def _has_glob(p: Path) -> bool:
@@ -121,14 +138,76 @@ def _load_checkpoint(path: Path) -> set[str]:
     return done
 
 
+def _acquire_orphan_lock(*, ignore: bool) -> None:
+    """Exclusive lock so two API backfills never run concurrently."""
+    ORPHAN_BACKFILL_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    if ignore and ORPHAN_BACKFILL_LOCK.exists():
+        ORPHAN_BACKFILL_LOCK.unlink()
+    try:
+        fd = os.open(str(ORPHAN_BACKFILL_LOCK), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(
+                fd,
+                f"pid={os.getpid()}\nutc={datetime.now(timezone.utc).isoformat()}\n".encode(),
+            )
+        finally:
+            os.close(fd)
+    except FileExistsError as e:
+        raise RuntimeError(
+            "orphan_backfill.lock exists — another fix_orphan_tickers.py is likely running. "
+            f"Stop the other process, or delete {ORPHAN_BACKFILL_LOCK} if it is stale, "
+            "or pass --ignore-orphan-lock."
+        ) from e
+
+
+def _release_orphan_lock() -> None:
+    ORPHAN_BACKFILL_LOCK.unlink(missing_ok=True)
+
+
 def _append_checkpoint(path: Path, ticker: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(ticker + "\n")
 
 
+def _try_fetch_market_live_then_historical(
+    client: httpx.Client, url_base: str, ticker: str
+) -> tuple[int, dict | None, str]:
+    """Try live single-market, then historical single-market (real API only).
+
+    Returns (status_code, json_body_or_none, source) where source is
+    'live', 'historical', or 'none' if body is None.
+    """
+    seg = quote(ticker, safe="")
+    live_url = f"{url_base}/markets/{seg}"
+    r = client.get(live_url)
+    if r.status_code == 200:
+        return 200, r.json(), "live"
+    if r.status_code != 404:
+        return r.status_code, None, "live"
+
+    hist_url = f"{url_base}{HISTORICAL_MARKETS_PATH}/{seg}"
+    r2 = client.get(hist_url)
+    if r2.status_code == 200:
+        return 200, r2.json(), "historical"
+    return r2.status_code, None, "historical"
+
+
+def _apply_checkpoint_and_max(args: argparse.Namespace, orphans: list[str]) -> list[str]:
+    """Filter by checkpoint file and --max cap (same rules as a single run)."""
+    if args.checkpoint and not args.ignore_checkpoint:
+        done = _load_checkpoint(args.checkpoint)
+        if done:
+            before = len(orphans)
+            orphans = [t for t in orphans if t not in done]
+            _log(f"Checkpoint: skipping {before - len(orphans):,} already done; {len(orphans):,} remaining")
+    if args.max is not None and len(orphans) > args.max:
+        _log(f"Capping this run to --max {args.max:,} tickers ({len(orphans):,} would run otherwise).")
+        orphans = orphans[: args.max]
+    return orphans
+
+
 def main() -> int:
-    import argparse
     parser = argparse.ArgumentParser(description="Fetch missing markets for orphan tickers")
     parser.add_argument("--dry-run", action="store_true", help="Only list orphan tickers, do not call API")
     parser.add_argument("--delay", type=float, default=0.2, help="Seconds between API calls (default 0.2)")
@@ -146,59 +225,133 @@ def main() -> int:
         help="Text file: one ticker per line already processed; append on success (resume long runs)",
     )
     parser.add_argument(
+        "--ignore-checkpoint",
+        action="store_true",
+        help="Do not skip tickers in --checkpoint (re-fetch with live+historical; use once after fetch logic changes)",
+    )
+    parser.add_argument(
         "--batch-rows",
         type=int,
         default=50_000,
         help="Flush Parquet part after this many rows (default 50000)",
     )
+    parser.add_argument(
+        "--ignore-orphan-lock",
+        action="store_true",
+        help=f"Remove stale {ORPHAN_BACKFILL_LOCK.name} and run (after verifying no other backfill is running)",
+    )
+    parser.add_argument(
+        "--repeat-until-done",
+        action="store_true",
+        help="After each batch of up to --max tickers, recompute orphans and continue until none remain (requires --max)",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --repeat-until-done, stop after N batches (default: unlimited)",
+    )
     args = parser.parse_args()
 
+    if args.repeat_until_done and args.max is None:
+        parser.error("--repeat-until-done requires --max (batch size per pass)")
+
     dry = args.dry_run
-    if dry:
-        _section("DRY RUN — no API calls, no writes")
+    skip_initial_step1 = bool(args.repeat_until_done and not dry)
+    orphans: list[str] = []
 
-    # ─── Step 1: Compute orphan tickers ───────────────────────────────────────
-    _section("STEP 1: Compute orphan tickers")
-    con = duckdb.connect()
+    if not skip_initial_step1:
+        if dry:
+            _section("DRY RUN — no API calls, no writes")
+
+        # ─── Step 1: Compute orphan tickers ───────────────────────────────────
+        _section("STEP 1: Compute orphan tickers")
+        con = duckdb.connect()
+        try:
+            orphans = _get_orphan_tickers(con)
+        finally:
+            con.close()
+
+        _log(f"Orphan tickers (in trades but not in markets): {len(orphans):,}")
+        if not orphans:
+            _log("None. REFERENTIAL_INTEGRITY is already satisfied.")
+            return 0
+
+        orphans = _apply_checkpoint_and_max(args, orphans)
+
+        if not orphans:
+            _log("Nothing to do after checkpoint / --max.")
+            return 0
+
+        if len(orphans) <= 30:
+            for t in orphans:
+                _log(f"    {t}")
+        else:
+            for t in orphans[:15]:
+                _log(f"    {t}")
+            _log(f"    ... and {len(orphans) - 15} more")
+
+        if dry:
+            _section("DRY RUN complete")
+            _log(
+                f"Would attempt to fetch {len(orphans):,} markets "
+                f"(GET /markets/{{ticker}}, then GET /historical/markets/{{ticker}} on 404)."
+            )
+            if args.repeat_until_done:
+                _log("(Dry-run runs once; omit --dry-run to use --repeat-until-done.)")
+            return 0
+
     try:
-        orphans = _get_orphan_tickers(con)
+        _acquire_orphan_lock(ignore=bool(args.ignore_orphan_lock))
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 2
+
+    try:
+        if args.repeat_until_done:
+            batch_num = 0
+            while True:
+                batch_num += 1
+                _section(f"BATCH {batch_num} (repeat until done)")
+                con = duckdb.connect()
+                try:
+                    batch_orphans = _get_orphan_tickers(con)
+                finally:
+                    con.close()
+                _log(f"Orphan tickers (in trades but not in markets): {len(batch_orphans):,}")
+                if not batch_orphans:
+                    _section("DONE (all orphans cleared)")
+                    _log("REFERENTIAL_INTEGRITY should be satisfied for remaining data.")
+                    return 0
+
+                work = _apply_checkpoint_and_max(args, batch_orphans)
+                if not work:
+                    _log("Nothing to do after checkpoint / --max; stopping repeat.")
+                    _log("(If orphans remain in DB, they may already be checkpointed, e.g. 404.)")
+                    return 0
+
+                if len(work) <= 30:
+                    for t in work:
+                        _log(f"    {t}")
+                else:
+                    for t in work[:15]:
+                        _log(f"    {t}")
+                    _log(f"    ... and {len(work) - 15} more")
+
+                rc = _run_orphan_api_fetch(args, work)
+                if rc != 0:
+                    return rc
+                if args.max_batches is not None and batch_num >= args.max_batches:
+                    _log(f"Stopped after {batch_num} batch(es) (--max-batches).")
+                    return 0
+        return _run_orphan_api_fetch(args, orphans)
     finally:
-        con.close()
+        _release_orphan_lock()
 
-    _log(f"Orphan tickers (in trades but not in markets): {len(orphans):,}")
-    if not orphans:
-        _log("None. REFERENTIAL_INTEGRITY is already satisfied.")
-        return 0
 
-    done: set[str] = set()
-    if args.checkpoint:
-        done = _load_checkpoint(args.checkpoint)
-        if done:
-            before = len(orphans)
-            orphans = [t for t in orphans if t not in done]
-            _log(f"Checkpoint: skipping {before - len(orphans):,} already done; {len(orphans):,} remaining")
-
-    if args.max is not None and len(orphans) > args.max:
-        _log(f"Capping this run to --max {args.max:,} tickers ({len(orphans):,} would run otherwise).")
-        orphans = orphans[: args.max]
-
-    if not orphans:
-        _log("Nothing to do after checkpoint / --max.")
-        return 0
-
-    if len(orphans) <= 30:
-        for t in orphans:
-            _log(f"    {t}")
-    else:
-        for t in orphans[:15]:
-            _log(f"    {t}")
-        _log(f"    ... and {len(orphans) - 15} more")
-
-    if dry:
-        _section("DRY RUN complete")
-        _log(f"Would attempt to fetch {len(orphans):,} markets from API (GET /markets/{{ticker}}).")
-        return 0
-
+def _run_orphan_api_fetch(args: argparse.Namespace, orphans: list[str]) -> int:
+    """Fetch orphans from API and write Parquet (caller holds orphan_backfill.lock)."""
     # ─── Step 2: Load update_forward for row mapping ───────────────────────────
     _section("STEP 2: Load row mapper and schema")
     uf = _load_update_forward()
@@ -213,7 +366,8 @@ def main() -> int:
     ingested_at = datetime.now(timezone.utc).isoformat()
     url_base = BASE_URL.rstrip("/")
     rows: list[dict] = []
-    found = 0
+    found_live = 0
+    found_historical = 0
     not_found = 0
     errors = 0
     parts_written = 0
@@ -233,30 +387,36 @@ def main() -> int:
 
     with httpx.Client(timeout=15.0) as client:
         for i, ticker in enumerate(orphans, 1):
-            url = f"{url_base}/markets/{ticker}"
             try:
-                resp = client.get(url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    m = data.get("market") or data
+                code, body, src = _try_fetch_market_live_then_historical(client, url_base, ticker)
+                if code == 200 and body is not None:
+                    raw = body.get("market") or body
+                    m = raw if isinstance(raw, dict) else {}
                     row = market_row_from_api(m, run_id=run_id, ingested_at=ingested_at)
                     rows.append(row)
-                    found += 1
+                    if src == "live":
+                        found_live += 1
+                    else:
+                        found_historical += 1
+                    found = found_live + found_historical
                     if args.checkpoint:
                         _append_checkpoint(args.checkpoint, ticker)
+                    tag = "live" if src == "live" else "historical"
                     if found <= 10 or found % 100 == 0 or i == len(orphans):
-                        _log(f"  [{i}/{len(orphans)}] {ticker}  -> 200 OK (total fetched: {found})")
+                        _log(
+                            f"  [{i}/{len(orphans)}] {ticker}  -> 200 OK ({tag}; total {found:,})"
+                        )
                     if len(rows) >= args.batch_rows:
                         flush_batch()
-                elif resp.status_code == 404:
+                elif code == 404:
                     not_found += 1
                     if args.checkpoint:
                         _append_checkpoint(args.checkpoint, ticker)
                     if not_found <= 5:
-                        _log(f"  [{i}/{len(orphans)}] {ticker}  -> 404 Not Found")
+                        _log(f"  [{i}/{len(orphans)}] {ticker}  -> 404 (live and historical)")
                 else:
                     errors += 1
-                    _log(f"  [{i}/{len(orphans)}] {ticker}  -> {resp.status_code} {resp.text[:80]}")
+                    _log(f"  [{i}/{len(orphans)}] {ticker}  -> {code} ({src})")
             except Exception as e:
                 errors += 1
                 _log(f"  [{i}/{len(orphans)}] {ticker}  -> ERROR: {e}")
@@ -264,8 +424,12 @@ def main() -> int:
 
     flush_batch()
 
+    found = found_live + found_historical
     _log("")
-    _log(f"Summary: fetched={found}, 404={not_found}, errors={errors}")
+    _log(
+        f"Summary: fetched={found} (live={found_live}, historical={found_historical}), "
+        f"404={not_found}, errors={errors}"
+    )
 
     if parts_written == 0:
         _section("DONE (nothing to write)")
@@ -279,6 +443,8 @@ def main() -> int:
         "run_id": run_id,
         "parts": parts_written,
         "fetched": found,
+        "fetched_live": found_live,
+        "fetched_historical": found_historical,
         "not_found": not_found,
         "errors": errors,
     }

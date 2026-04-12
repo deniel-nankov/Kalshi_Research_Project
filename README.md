@@ -116,6 +116,28 @@ uv run python scripts/validate_data_health.py --strict
 
 If you see **warnings** (e.g. duplicate market keys, orphan tickers, or a gap between historical and forward), what they mean and what to do are explained in [docs/HEALTH_REPORT_WARNINGS_EXAMINED.md](docs/HEALTH_REPORT_WARNINGS_EXAMINED.md). There are also one-off fix scripts (e.g. for orphans or duplicate markets); when to run them is documented in the pipeline summary.
 
+### AWS Tier 2 — graphs and snapshots (simple explanation)
+
+**Tier 2** means: after the daily health JSON is written, a short script sends the important numbers to **Amazon CloudWatch** so you can open a chart anytime (orphan tickers, duplicate rows, pass/warn/fail counts, etc.). Optionally it can also copy the health file plus a **dataset stats** text file to **S3** each run for a dated history.
+
+On the server: `infra/aws/bootstrap.sh` installs the **AWS CLI** (`aws`) for this script; run `sudo bash infra/aws/install-systemd.sh` (enables `kalshi-observability.timer` a few minutes after the daily health run). Attach an IAM role to the EC2 instance with `cloudwatch:PutMetricData` and, if you use it, `s3:PutObject` on your prefix. Edit `/etc/kalshi/observability.env` from `infra/aws/observability.env.example`. Try locally: `uv run python scripts/publish_tier2_observability.py --dry-run`.
+
+### Pre-deployment dry run (before EC2 or S3)
+
+Run **`./infra/aws/deploy_dry_run.sh`** from the repo root before `install-systemd`, real `update_forward`, or **`CONFIRM_SYNC=1`** S3 upload. It checks shell syntax, **preflight** Parquet, **`update_forward.py --dry-run`** (if `.env` exists), **strict health** (fails only on FAIL), forward audit, duplicate preflight, optional orphan audit, Tier 2 **CloudWatch dry-run**, and **`aws s3 sync --dryrun`** when **`S3_KALSHI_URI`** and the AWS CLI are available. Use **`SKIP_SLOW=1`** to skip the orphan audit. Use **`STRICT_RELEASE=1`** to also run the full **`institutional_data_release.sh`** gate. Writes **`data/kalshi/state/health_report_deploy_dry_run.json`**.
+
+### Planned maintenance (dry-run, then execute)
+
+Use **`scripts/institutional_maintenance.sh`** for a documented window: **`--dry-run`** runs the same institutional validation as release (including orphan audit) and only *prints* the `systemctl stop/start` lines — no writers stopped, no dedupe. **`--execute`** (as **root**) stops `kalshi-*.timer` services, runs `institutional_data_release.sh` with **`APPLY_REPAIR=1`**, then restarts timers; requires **`CONFIRM_MAINTENANCE=I_ACCEPT_DOWNTIME`**. Optional **`RUN_MARKETS_CANONICAL=1`** runs `fix_forward_markets_dedupe.py --yes --exclude-historical` after dedupe. Shell syntax is checked in CI (`bash -n`).
+
+### Institutional ops console (terminal + AWS)
+
+**`scripts/institutional_ops_console.py`** refreshes a Rich dashboard (health summary, checkpoints, latest `state/runs` JSON, `kalshi` systemd timers when present) and writes **`data/kalshi/state/ops_snapshot.json`** each refresh. Use **`--once`** for a non-interactive snapshot; use **`--daemon --interval SEC`** for headless mode (used by **`kalshi-ops-console.service`** on EC2 after `sudo bash infra/aws/install-systemd.sh`). Edit **`/etc/kalshi/ops-console.env`** from `infra/aws/ops-console.env.example`. Tier 2 can upload the snapshot if **`UPLOAD_OPS_SNAPSHOT=1`** (see `infra/aws/observability.env.example`); for log streaming see **`infra/aws/CLOUDWATCH_OPS_LOGS.txt`**.
+
+### Optional self-heal on WARN (limited)
+
+By default **nothing** repairs the dataset when `validate_data_health.py` reports WARN - you run fix scripts or `infra/aws/server-data-perfection.sh` yourself. **Orphan tickers** (trades without matching market rows) can be healed a little at a time: set `AUTO_HEAL_ORPHANS_MAX` in `/etc/kalshi/auto-heal.env` and run `sudo bash infra/aws/install-auto-heal-systemd.sh` to enable a **weekly** `kalshi-auto-heal.timer` that calls `scripts/auto_heal_guarded.py` then `fix_orphan_tickers.py` with a checkpoint. **`AUTO_HEAL_ORPHANS_MAX=0` stays the default** (no-op). **Duplicate markets / dedupe** is not auto-run while forward ingestion is active; use a maintenance window and `server-data-perfection.sh repair` (see `docs/DATA_REPAIR.md`).
+
 ---
 
 ## Running tests
@@ -157,6 +179,9 @@ We rely on these tests to ensure that the pipeline and validation behave correct
 | Inspect counts and date ranges | `uv run python scripts/inspect_kalshi_data.py` |
 | Run all tests | `uv run pytest tests/` |
 | Run tests without slow ones | `uv run pytest tests/ -m "not slow"` |
+| Pre-deploy dry run (no writes / no S3 upload) | `./infra/aws/deploy_dry_run.sh` |
+| Planned maintenance rehearsal | `./scripts/institutional_maintenance.sh --dry-run` |
+| Ops terminal / headless snapshot | `uv run python scripts/institutional_ops_console.py` |
 
 ---
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ from src.kalshi_forward.terminal_report import (
     blank,
     err,
     kv_table,
+    milestone,
     notice,
     phase,
     simple_banner,
@@ -92,7 +94,17 @@ def main() -> int:
         type=float,
         default=6.0,
         metavar="G",
-        help="DuckDB memory_limit GB (default 6)",
+        help="DuckDB memory_limit at connect (default 6); materialize uses --materialize-memory-limit-gb if set",
+    )
+    parser.add_argument(
+        "--materialize-memory-limit-gb",
+        type=float,
+        default=None,
+        metavar="G",
+        help=(
+            "SET memory_limit before CREATE market_winners (large PARTITION BY window). "
+            "Default: env KALSHI_DEDUPE_MARKETS_MATERIALIZE_GIB or 28 (cap 62)."
+        ),
     )
     args = parser.parse_args()
 
@@ -171,6 +183,25 @@ def main() -> int:
             phase(2, "STATS-ONLY complete")
             warn(f"~{dup_rows:,} redundant rows; full run required to remove.")
             return 0
+
+        mat_gb = args.materialize_memory_limit_gb
+        if mat_gb is None:
+            raw = os.environ.get("KALSHI_DEDUPE_MARKETS_MATERIALIZE_GIB", "28").strip()
+            try:
+                mat_gb = float(raw) if raw else 28.0
+            except ValueError:
+                mat_gb = 28.0
+        mat_gb = min(max(mat_gb, float(args.memory_limit_gb)), 62.0)
+        milestone(
+            "MATERIALIZE_TUNING",
+            f"SET memory_limit={mat_gb:.1f}GiB threads=1 for PARTITION BY materialize (connect cap was {args.memory_limit_gb:.1f}GiB)",
+        )
+        try:
+            con.execute("SET preserve_insertion_order=false")
+        except Exception:
+            pass
+        con.execute("SET threads=1")
+        con.execute(f"SET memory_limit='{mat_gb:.1f}GB'")
 
         notice("Materializing winning rows…")
         con.execute("DROP TABLE IF EXISTS market_winners")

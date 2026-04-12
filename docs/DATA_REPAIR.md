@@ -2,6 +2,20 @@
 
 Use this when `validate_data_health.py` reports duplicate `trade_id`s / market keys or orphan tickers.
 
+## Phased procedure (rigorous)
+
+Do **not** skip preflight on a full corpus.
+
+1. **Preflight (read-only, ~1–2 min on large data):** `uv run python scripts/run_institutional_data_repair.py` — confirms duplicate *estimates*, disk headroom, lock status. No Parquet writes.
+2. **Optional deeper dry-run (heavy):** `uv run python scripts/dedupe_forward_trades.py --dry-run` — materializes a winner plan; long. Use when you need per-file detail before apply.
+3. **Apply dedupe (rewrites forward Parquet; backups under `historical/forward_*_pre_dedupe_*`):** `uv run python scripts/run_institutional_data_repair.py --apply` — trades then markets, then `validate_forward_pipeline.py --skip-run`, then full health.
+4. **Strict health gate:** add `--health-strict` so `validate_data_health.py` exits non-zero on any FAIL; JSON at `data/kalshi/state/health_report_post_repair.json` (override with `--health-output PATH`).
+5. **REFERENTIAL_INTEGRITY WARN (orphans):** not fixed by dedupe. After keys are clean, use `fix_orphan_tickers.py` with `.env` API keys, checkpoint, and repeated `--max` batches (`docs/HEALTH_REPORT_WARNINGS_EXAMINED.md`).
+
+**Windows console:** If Unicode banners error, use Git Bash or `chcp 65001`, or rely on the ASCII fallback in `terminal_report.py` (recent versions).
+
+**Legacy / non-canonical files:** Canonical Kalshi data lives under `data/kalshi/historical/` (trades shards, `markets.parquet`, `forward_trades/`, `forward_markets/`). The small CSVs under `data/kalshi/raw/` are only used by the older `run_all_analyses.py` demo path; do **not** delete them unless you change that script. Optional legacy dirs `data/kalshi/trades/`, `data/kalshi/markets/`, `data/kalshi/incremental/` are read by the health validator **only if present** — remove only after confirming they are empty or duplicated and backups exist.
+
 ## One-command institutional flow (recommended)
 
 High-visibility terminal output (banners, phases, disk/lock preflight):
@@ -12,6 +26,9 @@ uv run python scripts/run_institutional_data_repair.py
 
 # Full dedupe + validators (long on large data)
 uv run python scripts/run_institutional_data_repair.py --apply
+
+# Same, but fail the run if health has any FAIL (--strict) and save JSON artifact
+uv run python scripts/run_institutional_data_repair.py --apply --health-strict
 
 # Apply + skip the slow full health script; still runs validate_forward_pipeline
 uv run python scripts/run_institutional_data_repair.py --apply --skip-full-health
@@ -93,6 +110,14 @@ uv run python scripts/dedupe_forward_trades.py --yes --ignore-lock --max-temp-gi
 ```
 
 If spill still fills the disk, free space first or use a larger external `--temp-directory`.
+
+### OutOfMemory on `rewrite_file_1` (per-file COPY after `trade_winners` built)
+
+The window query may succeed at `--memory-limit-gb 6`, but **each Parquet COPY** can use extra RAM (buffers + compression). The dedupe script now **raises `memory_limit` and sets `threads=1` for the COPY phase** (default export target **max(12 GiB, 2× window limit)**), and defaults to **Snappy** compression instead of ZSTD for exports.
+
+If you still OOM: `uv run python scripts/dedupe_forward_trades.py --yes --ignore-lock --export-memory-limit-gb 40` (or higher on a 64 GiB machine), or `--copy-compression uncompressed` (larger files, lower CPU/RAM for codec). The script avoids `COUNT(*)` per file (uses `EXISTS`) so the first file does not scan hundreds of millions of rows just to get a count.
+
+To avoid the **connect-time 6 GiB** cap during COPY, use **`--no-export-memory-limit`** (sets a **high** `memory_limit` for export, default **52 GiB** via `SET`, or env **`KALSHI_DEDUPE_EXPORT_GIB`**). Plain `RESET memory_limit` does **not** override the limit from `duckdb.connect(config=...)`.
 
 If materialization fails after using **most** of `max_temp_directory_size` (e.g. **30 GiB / 32 GiB**), DuckDB often needs **more temp headroom** *and* a **lower in-memory budget** so it spills earlier:
 
