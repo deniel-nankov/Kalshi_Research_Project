@@ -23,7 +23,13 @@ if [[ ! -f /etc/kalshi/ops-console.env ]]; then
   chmod 644 /etc/kalshi/ops-console.env
   echo "Created /etc/kalshi/ops-console.env (OPS_CONSOLE_INTERVAL for kalshi-ops-console.service)."
 fi
+if [[ ! -f /etc/kalshi/s3-verified-sync.env ]]; then
+  cp "$ROOT/infra/aws/s3-verified-sync.env.example" /etc/kalshi/s3-verified-sync.env
+  chmod 644 /etc/kalshi/s3-verified-sync.env
+  echo "Created /etc/kalshi/s3-verified-sync.env (set S3_KALSHI_URI + ENABLE_KALSHI_S3_VERIFIED_SYNC=1 for daily verified S3 upload)."
+fi
 chmod +x "$ROOT/infra/aws/run-update-forward.sh" 2>/dev/null || true
+chmod +x "$ROOT/infra/aws/run-s3-verified-sync.sh" 2>/dev/null || true
 chmod +x "$ROOT/infra/aws/test-pipeline.sh" 2>/dev/null || true
 chmod +x "$ROOT/infra/aws/run-ops-console-daemon.sh" 2>/dev/null || true
 cp "$UNIT_DIR/kalshi-forward.service" /etc/systemd/system/
@@ -33,12 +39,16 @@ cp "$UNIT_DIR/kalshi-health.timer" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-observability.service" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-observability.timer" /etc/systemd/system/
 cp "$UNIT_DIR/kalshi-ops-console.service" /etc/systemd/system/
+cp "$UNIT_DIR/kalshi-s3-verified-sync.service" /etc/systemd/system/
+cp "$UNIT_DIR/kalshi-s3-verified-sync.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now kalshi-forward.timer
 systemctl enable --now kalshi-health.timer
 systemctl enable --now kalshi-observability.timer
+systemctl enable --now kalshi-s3-verified-sync.timer
 systemctl enable --now kalshi-ops-console.service
 echo "Enabled timers + kalshi-ops-console.service. Check: systemctl list-timers | grep kalshi"
 echo "Ops snapshot: journalctl -u kalshi-ops-console.service -n 50"
+echo "Verified S3: edit /etc/kalshi/s3-verified-sync.env then journalctl -u kalshi-s3-verified-sync.service -n 100"
 echo "Logs: journalctl -u kalshi-forward.service -f"
 echo "Before relying on timers: sudo -u ubuntu bash $ROOT/infra/aws/test-pipeline.sh"

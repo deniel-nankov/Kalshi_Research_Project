@@ -1,0 +1,17 @@
+[Unit]
+Description=Kalshi — verified S3 upload (institutional gate then aws s3 sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+ExecStartPre=/bin/install -d -m 755 -o ubuntu -g ubuntu /opt/kalshi-pipeline/data/kalshi/state
+ExecStart=/bin/bash /opt/kalshi-pipeline/infra/aws/run-s3-verified-sync.sh
+TimeoutStartSec=0
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
