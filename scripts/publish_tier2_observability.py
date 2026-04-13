@@ -33,8 +33,22 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _is_git_lfs_pointer_text(raw: str) -> bool:
+    head = (raw or "").lstrip()[:200]
+    return head.startswith("version https://git-lfs.github.com/spec/v1")
+
+
 def _load_report(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        raise ValueError(f"{path} is empty — run kalshi-health or: uv run python scripts/validate_data_health.py --output {path}")
+    if _is_git_lfs_pointer_text(raw):
+        raise ValueError(
+            f"{path} is a Git LFS pointer, not JSON (repo had data/** as LFS). On EC2 run:\n"
+            f"  cd {PROJECT_ROOT} && uv run python scripts/validate_data_health.py --output {path}\n"
+            "Or wait for kalshi-health.timer. Pull latest repo: state health_report*.json are no longer tracked."
+        )
+    return json.loads(raw)
 
 
 def _check_details(report: dict[str, Any], name: str) -> dict[str, Any]:
@@ -237,7 +251,11 @@ def main() -> int:
         print(f"No health report at {path} — run validate_data_health.py first.", file=sys.stderr)
         return 1
 
-    report = _load_report(path)
+    try:
+        report = _load_report(path)
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"{path}: {e}", file=sys.stderr)
+        return 1
     namespace = str(args.namespace).strip() or "KalshiData"
     metric_data = _metric_data_entries(report)
     s3_uri = os.environ.get("S3_TIER2_URI", "").strip()

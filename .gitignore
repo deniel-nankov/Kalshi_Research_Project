@@ -34,3 +34,10 @@ data/kalshi/state/duckdb_dedupe_spill/
 # Local run logs / pid files (do not commit)
 data/kalshi/state/*.log
 data/kalshi/state/*.pid
+
+# Health JSON is generated on each machine (kalshi-health / validate_data_health). Do not commit — LFS
+# pointers under data/** broke Tier 2 (JSONDecodeError) on fresh EC2 clones.
+data/kalshi/state/health_report.json
+data/kalshi/state/health_report_latest.json
+data/kalshi/state/health_report_pre_release.json
+data/kalshi/state/health_report_deploy_dry_run.json
