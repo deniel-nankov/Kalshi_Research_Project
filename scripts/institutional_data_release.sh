@@ -13,7 +13,16 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-UV="${UV:-uv}"
+# systemd oneshots often omit /usr/local/bin; EC2 bootstrap installs uv there (see run-update-forward.sh).
+export PATH="/usr/local/bin:${PATH:-/usr/bin:/bin}"
+UV="${UV:-}"
+if [[ -z "$UV" ]]; then
+  if [[ -x /usr/local/bin/uv ]]; then
+    UV=/usr/local/bin/uv
+  else
+    UV=uv
+  fi
+fi
 
 step() {
   echo ""
@@ -27,7 +36,7 @@ fail() {
   exit 1
 }
 
-command -v "$UV" >/dev/null 2>&1 || fail "uv not found; install or set UV=/path/to/uv"
+command -v "$UV" >/dev/null 2>&1 || fail "uv not found (expected /usr/local/bin/uv after bootstrap); install uv or set UV=/path/to/uv"
 
 step "1/5 Preflight — readable Parquet, no LFS stubs (strict; API keys optional)"
 "$UV" run python scripts/preflight_ec2_pipeline.py --strict --skip-api-keys

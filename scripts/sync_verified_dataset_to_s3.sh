@@ -21,9 +21,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export PATH="/usr/local/bin:${PATH:-/usr/bin:/bin}"
 : "${S3_KALSHI_URI:?Set S3_KALSHI_URI (see scripts/sync_kalshi_data_to_s3.sh)}"
 
-command -v aws >/dev/null 2>&1 || { echo "aws CLI not found" >&2; exit 1; }
+command -v aws >/dev/null 2>&1 || { echo "aws CLI not found (install infra/aws/install-aws-cli-v2.sh or add to PATH)" >&2; exit 1; }
 
 if [[ "${SKIP_ORPHAN_AUDIT:-0}" == "1" ]]; then
   export ORPHAN_AUDIT=0
