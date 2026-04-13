@@ -143,6 +143,8 @@ cd kalshi-pipeline
 
 On the server: `infra/aws/bootstrap.sh` installs the **AWS CLI** (`aws`) for this script; run `sudo bash infra/aws/install-systemd.sh` (enables `kalshi-observability.timer` a few minutes after the daily health run). Attach an IAM role to the EC2 instance with `cloudwatch:PutMetricData` and, if you use it, `s3:PutObject` on your prefix. Edit `/etc/kalshi/observability.env` from `infra/aws/observability.env.example`. Try locally: `uv run python scripts/publish_tier2_observability.py --dry-run`.
 
+If **`aws`** is missing on Ubuntu ( **`apt install awscli`** has no candidate), run **`sudo bash infra/aws/install-aws-cli-v2.sh`** from the repo (or re-run **`sudo bash infra/aws/bootstrap.sh`** on a fresh host).
+
 The same install enables **`kalshi-s3-verified-sync.timer`** (daily **07:00** UTC): full **`data/kalshi/`** upload runs only after the institutional gate passes. Until **`ENABLE_KALSHI_S3_VERIFIED_SYNC=1`** and **`S3_KALSHI_URI`** are set in **`/etc/kalshi/s3-verified-sync.env`** (from `infra/aws/s3-verified-sync.env.example`), the unit logs a skip and exits **0**. Grant the instance role **`s3:PutObject`** / sync permissions on that URI. Smoke test: **`sudo systemctl start kalshi-s3-verified-sync.service`** then **`journalctl -u kalshi-s3-verified-sync.service -n 200`**.
 
 ### Pre-deployment dry run (before EC2 or S3)
