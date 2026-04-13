@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 User=ubuntu
 Group=ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 WorkingDirectory=/opt/kalshi-pipeline
 EnvironmentFile=-/etc/kalshi/observability.env
 ExecStartPre=/bin/install -d -m 755 -o ubuntu -g ubuntu /opt/kalshi-pipeline/data/kalshi/state

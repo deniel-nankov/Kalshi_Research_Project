@@ -12,6 +12,7 @@
 # Optional:
 #   SKIP_ORPHAN_AUDIT=1 ./scripts/sync_verified_dataset_to_s3.sh   # faster gate (skips fix_orphan_tickers --dry-run)
 #   APPLY_REPAIR=1 ./scripts/sync_verified_dataset_to_s3.sh       # run dedupe apply before gate (maintenance)
+#   RUN_TIER2_PUBLISH_AFTER_SYNC=1  # after successful s3 sync, run publish_tier2_observability.py (loads /etc/kalshi/observability.env if present)
 #
 # S3 bucket hardening (run once per bucket; replace BUCKET and REGION):
 #   aws s3api put-bucket-versioning --bucket BUCKET --versioning-configuration Status=Enabled
@@ -41,3 +42,28 @@ CONFIRM_SYNC=1 bash scripts/sync_kalshi_data_to_s3.sh
 
 echo ""
 echo "OK: verified dataset synced to S3."
+
+if [[ "${RUN_TIER2_PUBLISH_AFTER_SYNC:-0}" == "1" ]]; then
+  echo ""
+  echo "=== Tier 2 (CloudWatch + optional S3 snapshot via observability.env) ==="
+  if [[ -f /etc/kalshi/observability.env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/kalshi/observability.env
+    set +a
+  fi
+  UV_BIN="${UV:-}"
+  if [[ -z "$UV_BIN" ]]; then
+    if [[ -x /usr/local/bin/uv ]]; then
+      UV_BIN=/usr/local/bin/uv
+    else
+      UV_BIN=uv
+    fi
+  fi
+  command -v "$UV_BIN" >/dev/null 2>&1 || {
+    echo "Tier 2: uv not found; install uv or set UV=/path/to/uv" >&2
+    exit 1
+  }
+  "$UV_BIN" run python scripts/publish_tier2_observability.py
+  echo "OK: Tier 2 publish finished."
+fi

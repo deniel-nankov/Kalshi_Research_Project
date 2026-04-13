@@ -18,4 +18,6 @@ if [[ -z "${S3_KALSHI_URI:-}" ]]; then
 fi
 
 export S3_KALSHI_URI
+export PATH="/usr/local/bin:${PATH:-/usr/bin:/bin}"
+export RUN_TIER2_PUBLISH_AFTER_SYNC="${RUN_TIER2_PUBLISH_AFTER_SYNC:-0}"
 exec bash scripts/sync_verified_dataset_to_s3.sh

@@ -8,7 +8,7 @@ Plain language:
   - Optionally it uploads that JSON plus dataset_stats output to S3 with a timestamp folder.
 
 Uses the **AWS CLI** (`aws`) — no boto3 in this project (avoids Python 3.9 / urllib3 conflicts).
-Install on Ubuntu EC2:  sudo apt-get install -y awscli   OR Amazon’s v2 bundle; attach an IAM role.
+Install on Ubuntu EC2:  sudo bash infra/aws/install-aws-cli-v2.sh  (or bootstrap.sh); attach an IAM role.
 
 Examples:
   uv run python scripts/publish_tier2_observability.py --dry-run
@@ -152,7 +152,7 @@ def _put_metric_data_cli(namespace: str, metric_data: list[dict[str, Any]], dry_
     resolved = _aws_cli_resolved()
     if not dry_run and not resolved:
         raise RuntimeError(
-            f"AWS CLI not found ({_aws_bin()}). On EC2: sudo apt-get install -y awscli "
+            f"AWS CLI not found ({_aws_bin()}). On EC2: sudo bash infra/aws/install-aws-cli-v2.sh "
             "and attach an IAM instance profile (or configure credentials)."
         )
     batch_size = 20

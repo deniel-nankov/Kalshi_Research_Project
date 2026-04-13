@@ -147,6 +147,8 @@ If **`aws`** is missing on Ubuntu ( **`apt install awscli`** has no candidate), 
 
 The same install enables **`kalshi-s3-verified-sync.timer`** (daily **07:00** UTC): full **`data/kalshi/`** upload runs only after the institutional gate passes. Until **`ENABLE_KALSHI_S3_VERIFIED_SYNC=1`** and **`S3_KALSHI_URI`** are set in **`/etc/kalshi/s3-verified-sync.env`** (from `infra/aws/s3-verified-sync.env.example`), the unit logs a skip and exits **0**. Grant the instance role **`s3:PutObject`** / sync permissions on that URI. Smoke test: **`sudo systemctl start kalshi-s3-verified-sync.service`** then **`journalctl -u kalshi-s3-verified-sync.service -n 200`**.
 
+**Turning on “full” Tier 2 + pristine data to two S3 uses:** (1) Edit **`/etc/kalshi/observability.env`**: set **`AWS_REGION`**, uncomment **`S3_TIER2_URI`** (small dated snapshots: health JSON, stats, optional **`UPLOAD_OPS_SNAPSHOT=1`**). (2) Edit **`/etc/kalshi/s3-verified-sync.env`**: set **`S3_KALSHI_URI`** for the **full Parquet tree**, **`ENABLE_KALSHI_S3_VERIFIED_SYNC=1`**, and optionally **`RUN_TIER2_PUBLISH_AFTER_SYNC=1`** to run **`publish_tier2_observability.py`** immediately after a successful verified sync (still keep **`kalshi-observability.timer`** for daily metrics). The full upload **requires real Parquet on disk** (not Git LFS pointers); use **`git lfs pull`**, **rsync**, or a maintenance repair path until **`preflight_ec2_pipeline.py --strict`** passes.
+
 ### Pre-deployment dry run (before EC2 or S3)
 
 Run **`./infra/aws/deploy_dry_run.sh`** from the repo root before `install-systemd`, real `update_forward`, or **`CONFIRM_SYNC=1`** S3 upload. It checks shell syntax, **preflight** Parquet, **`update_forward.py --dry-run`** (if `.env` exists), **strict health** (fails only on FAIL), forward audit, duplicate preflight, optional orphan audit, Tier 2 **CloudWatch dry-run**, and **`aws s3 sync --dryrun`** when **`S3_KALSHI_URI`** and the AWS CLI are available. Use **`SKIP_SLOW=1`** to skip the orphan audit. Use **`STRICT_RELEASE=1`** to also run the full **`institutional_data_release.sh`** gate. Writes **`data/kalshi/state/health_report_deploy_dry_run.json`**.
@@ -207,6 +209,8 @@ We rely on these tests to ensure that the pipeline and validation behave correct
 | Pre-deploy dry run (no writes / no S3 upload) | `./infra/aws/deploy_dry_run.sh` |
 | Upload to S3 only after strict health gate passes | `./scripts/sync_verified_dataset_to_s3.sh` (set `S3_KALSHI_URI`) |
 | EC2: daily verified S3 upload (systemd) | Edit `/etc/kalshi/s3-verified-sync.env`, then `sudo systemctl start kalshi-s3-verified-sync.service` (timer: `kalshi-s3-verified-sync.timer`) |
+| Tier 2 + Tier-2 S3 snapshots on EC2 | Edit `/etc/kalshi/observability.env` (`S3_TIER2_URI`, `AWS_REGION`; optional `UPLOAD_OPS_SNAPSHOT=1`) — `kalshi-observability.timer` |
+| After verified full sync, run Tier 2 publish once | Set `RUN_TIER2_PUBLISH_AFTER_SYNC=1` in `/etc/kalshi/s3-verified-sync.env` (needs `observability.env` + `health_report.json`) |
 | Planned maintenance rehearsal | `./scripts/institutional_maintenance.sh --dry-run` |
 | Ops terminal / headless snapshot | `uv run python scripts/institutional_ops_console.py` |
 
