@@ -292,8 +292,20 @@ def main() -> int:
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     health_bytes = path.read_bytes()
+    stats_text = ""
+    if not args.skip_data_stats:
+        try:
+            stats_text = _run_data_stats()
+        except RuntimeError as e:
+            # EC2 clones often have LFS pointers / corrupt Parquet; CloudWatch already published above.
+            stats_text = (
+                "ERROR: dataset_stats.py did not complete (unreadable Parquet or other).\n"
+                f"Detail: {e}\n"
+                "health_report.json was still uploaded to this prefix.\n"
+            )
+            print(f"Warning: S3 dataset_stats.txt will contain error text only: {e}", file=sys.stderr)
+
     try:
-        stats_text = "" if args.skip_data_stats else _run_data_stats()
         bucket, key_prefix = _parse_s3_uri(s3_uri)
         base = f"{key_prefix}{stamp}/"
         _upload_s3_cli(
