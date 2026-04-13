@@ -2,6 +2,7 @@
 # Sync data/kalshi/ to S3 using an access point or bucket URI.
 #
 # Prerequisite: run institutional_data_release.sh (with APPLY_REPAIR=1 if needed) until it passes.
+# One-shot verified upload: ./scripts/sync_verified_dataset_to_s3.sh (runs gate then CONFIRM_SYNC=1).
 #
 # Configure AWS CLI (aws configure, or IAM role on EC2), then:
 #

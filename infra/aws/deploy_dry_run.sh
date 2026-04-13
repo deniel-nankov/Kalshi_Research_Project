@@ -38,6 +38,8 @@ done
 bash -n "$ROOT/scripts/institutional_maintenance.sh" || fail "bash -n institutional_maintenance.sh"
 bash -n "$ROOT/scripts/institutional_data_release.sh" || fail "bash -n institutional_data_release.sh"
 bash -n "$ROOT/scripts/sync_kalshi_data_to_s3.sh" || fail "bash -n sync_kalshi_data_to_s3.sh"
+bash -n "$ROOT/scripts/sync_verified_dataset_to_s3.sh" || fail "bash -n sync_verified_dataset_to_s3.sh"
+bash -n "$ROOT/infra/aws/run-s3-verified-sync.sh" || fail "bash -n run-s3-verified-sync.sh"
 echo "OK: bash -n on deploy-related shell scripts"
 
 if [[ "${DEPLOY_CHECK_SYSTEMD:-0}" == "1" ]] && command -v systemd-analyze >/dev/null 2>&1; then

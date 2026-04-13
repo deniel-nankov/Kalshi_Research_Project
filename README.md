@@ -116,11 +116,34 @@ uv run python scripts/validate_data_health.py --strict
 
 If you see **warnings** (e.g. duplicate market keys, orphan tickers, or a gap between historical and forward), what they mean and what to do are explained in [docs/HEALTH_REPORT_WARNINGS_EXAMINED.md](docs/HEALTH_REPORT_WARNINGS_EXAMINED.md). There are also one-off fix scripts (e.g. for orphans or duplicate markets); when to run them is documented in the pipeline summary.
 
+### EC2 clone (canonical GitHub repo)
+
+Repository: **[github.com/deniel-nankov/Kalshi_Research_Project](https://github.com/deniel-nankov/Kalshi_Research_Project)**.
+
+**Option A — first-run script from GitHub (fresh box, as root):** clones to `/opt/kalshi-pipeline` by default.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deniel-nankov/Kalshi_Research_Project/main/infra/aws/ec2-first-run.sh | sudo bash
+```
+
+Override clone URL or branch only if you use a fork: `sudo GIT_URL=... GIT_BRANCH=main bash ec2-first-run.sh`.
+
+**Option B — manual clone as `ubuntu`:**
+
+```bash
+sudo mkdir -p /opt && sudo chown ubuntu:ubuntu /opt
+cd /opt
+git clone https://github.com/deniel-nankov/Kalshi_Research_Project.git kalshi-pipeline
+cd kalshi-pipeline
+```
+
 ### AWS Tier 2 — graphs and snapshots (simple explanation)
 
 **Tier 2** means: after the daily health JSON is written, a short script sends the important numbers to **Amazon CloudWatch** so you can open a chart anytime (orphan tickers, duplicate rows, pass/warn/fail counts, etc.). Optionally it can also copy the health file plus a **dataset stats** text file to **S3** each run for a dated history.
 
 On the server: `infra/aws/bootstrap.sh` installs the **AWS CLI** (`aws`) for this script; run `sudo bash infra/aws/install-systemd.sh` (enables `kalshi-observability.timer` a few minutes after the daily health run). Attach an IAM role to the EC2 instance with `cloudwatch:PutMetricData` and, if you use it, `s3:PutObject` on your prefix. Edit `/etc/kalshi/observability.env` from `infra/aws/observability.env.example`. Try locally: `uv run python scripts/publish_tier2_observability.py --dry-run`.
+
+The same install enables **`kalshi-s3-verified-sync.timer`** (daily **07:00** UTC): full **`data/kalshi/`** upload runs only after the institutional gate passes. Until **`ENABLE_KALSHI_S3_VERIFIED_SYNC=1`** and **`S3_KALSHI_URI`** are set in **`/etc/kalshi/s3-verified-sync.env`** (from `infra/aws/s3-verified-sync.env.example`), the unit logs a skip and exits **0**. Grant the instance role **`s3:PutObject`** / sync permissions on that URI. Smoke test: **`sudo systemctl start kalshi-s3-verified-sync.service`** then **`journalctl -u kalshi-s3-verified-sync.service -n 200`**.
 
 ### Pre-deployment dry run (before EC2 or S3)
 
@@ -180,6 +203,8 @@ We rely on these tests to ensure that the pipeline and validation behave correct
 | Run all tests | `uv run pytest tests/` |
 | Run tests without slow ones | `uv run pytest tests/ -m "not slow"` |
 | Pre-deploy dry run (no writes / no S3 upload) | `./infra/aws/deploy_dry_run.sh` |
+| Upload to S3 only after strict health gate passes | `./scripts/sync_verified_dataset_to_s3.sh` (set `S3_KALSHI_URI`) |
+| EC2: daily verified S3 upload (systemd) | Edit `/etc/kalshi/s3-verified-sync.env`, then `sudo systemctl start kalshi-s3-verified-sync.service` (timer: `kalshi-s3-verified-sync.timer`) |
 | Planned maintenance rehearsal | `./scripts/institutional_maintenance.sh --dry-run` |
 | Ops terminal / headless snapshot | `uv run python scripts/institutional_ops_console.py` |
 

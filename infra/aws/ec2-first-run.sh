@@ -2,10 +2,8 @@
 #
 # Run once on a fresh Ubuntu EC2 instance (as root: sudo bash ec2-first-run.sh).
 #
-# Required env:
-#   GIT_URL   — https or ssh clone URL for this repo
-#
 # Optional env:
+#   GIT_URL      — default https://github.com/deniel-nankov/Kalshi_Research_Project.git (override for a fork)
 #   GIT_BRANCH   — default main
 #   RUN_DIAGNOSE — set to 1 to run server-data-perfection.sh diagnose after install
 #   RUN_REPAIR   — set to 1 to run repair (dedupe); implies a maintenance window
@@ -17,7 +15,7 @@ if [[ "${EUID:-0}" -ne 0 ]]; then
   exit 1
 fi
 
-: "${GIT_URL:?Set GIT_URL to your repository clone URL}"
+GIT_URL="${GIT_URL:-https://github.com/deniel-nankov/Kalshi_Research_Project.git}"
 
 BRANCH="${GIT_BRANCH:-main}"
 ROOT=/opt/kalshi-pipeline

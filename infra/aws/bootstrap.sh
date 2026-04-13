@@ -15,7 +15,7 @@ install -d -m 755 /opt/kalshi-pipeline
 chown ubuntu:ubuntu /opt/kalshi-pipeline
 
 echo "Next (as ubuntu):"
-echo "  cd /opt && sudo -u ubuntu git clone <YOUR_REPO_URL> kalshi-pipeline"
+echo "  cd /opt && sudo -u ubuntu git clone https://github.com/deniel-nankov/Kalshi_Research_Project.git kalshi-pipeline"
 echo "  cd /opt/kalshi-pipeline && sudo -u ubuntu uv sync"
 echo "  sudo -u ubuntu install -m 600 your-local-.env /opt/kalshi-pipeline/.env   # KALSHI_API_KEY_ID + KALSHI_API_PRIVATE_KEY"
 echo "  sudo bash infra/aws/install-systemd.sh"
