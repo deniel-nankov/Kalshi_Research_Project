@@ -1,0 +1,27 @@
+[Unit]
+Description=Kalshi forecast percentile history capture (capture_forecast_percentile.py)
+After=network-online.target kalshi-forward.service
+Wants=network-online.target
+StartLimitIntervalSec=1800
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# Reads forward_markets to enumerate numeric events (strike_type IN
+# {greater, greater_or_equal, less, between, structured}), then pulls
+# percentile history per event. Currently most events return 400 ("no
+# forecast published"), which is expected — Kalshi only publishes
+# distributions for macro/economic series (CPI, fed rate, inflation).
+# This script is idempotent: running daily picks up new series.
+ExecStart=/opt/kalshi-pipeline/.venv/bin/python3 /opt/kalshi-pipeline/scripts/capture_forecast_percentile.py --concurrency 4
+TimeoutStartSec=1800
+Nice=15
+MemoryMax=1G
+Restart=on-failure
+RestartSec=300
+
+[Install]
+WantedBy=multi-user.target

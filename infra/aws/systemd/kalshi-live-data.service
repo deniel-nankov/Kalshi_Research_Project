@@ -1,0 +1,27 @@
+[Unit]
+Description=Kalshi live-data play-by-play capture (capture_live_data.py)
+After=network-online.target kalshi-milestones.service
+Wants=network-online.target
+Requires=kalshi-milestones.service
+# Live-data depends on a populated forward_milestones table. Requires=
+# above ensures milestones runs (or is already complete) before this one.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# concurrency=8 → ~2.5 min/pass over ~3 K active milestones. The
+# --no-player-stats flag shrinks payloads ~50% (player stats are only
+# useful for the per-player detector we haven't built yet).
+ExecStart=/opt/kalshi-pipeline/.venv/bin/python3 /opt/kalshi-pipeline/scripts/capture_live_data.py --concurrency 8 --no-player-stats
+TimeoutStartSec=420
+Nice=10
+MemoryMax=2G
+Restart=on-failure
+RestartSec=120
+
+[Install]
+WantedBy=multi-user.target

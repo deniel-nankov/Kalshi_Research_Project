@@ -1,0 +1,28 @@
+[Unit]
+Description=Kalshi WebSocket market lifecycle stream (capture_lifecycle_ws.py)
+After=network-online.target
+Wants=network-online.target
+# Long-running daemon: same start-limit tuning as kalshi-ws-microstructure
+# so noisy reconnects don't trip the burst guard. The script has its own
+# exponential reconnect backoff.
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# Subscribes to market_lifecycle_v2 + multivariate_market_lifecycle and
+# flushes every 60 sec or 500 messages, whichever first. Each flush
+# writes a parquet + SHA-256 sidecar. Memory steady-state ~150 MB.
+ExecStart=/opt/kalshi-pipeline/.venv/bin/python3 /opt/kalshi-pipeline/scripts/capture_lifecycle_ws.py
+MemoryMax=1G
+Restart=always
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

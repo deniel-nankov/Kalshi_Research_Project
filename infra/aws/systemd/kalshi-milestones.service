@@ -1,0 +1,26 @@
+[Unit]
+Description=Kalshi milestones capture (capture_milestones.py)
+After=network-online.target
+Wants=network-online.target
+# This is a fast (~15s) oneshot; if it fails repeatedly, the burst guard
+# pauses retries so a backend outage doesn't generate hundreds of alerts.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# Pull every milestone that updated since our checkpoint. First run on a
+# fresh box pulls ~76 K rows in ~15 sec; steady-state runs pull a few
+# hundred deltas. Auth is NOT required for /milestones.
+ExecStart=/opt/kalshi-pipeline/.venv/bin/python3 /opt/kalshi-pipeline/scripts/capture_milestones.py
+TimeoutStartSec=300
+Nice=10
+MemoryMax=1G
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

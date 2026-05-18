@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Kalshi milestones capture every 5 minutes
+
+[Timer]
+# Stagger boot pile-up: forward fires at +2 min, this fires at +4 min.
+OnBootSec=4min
+OnUnitActiveSec=5min
+# If a slot was missed (instance was stopped), catch up the next time
+# the timer is enabled. Adds 30 sec random jitter so re-boots of many
+# instances don't all hit the API simultaneously.
+Persistent=true
+RandomizedDelaySec=30s
+Unit=kalshi-milestones.service
+
+[Install]
+WantedBy=timers.target

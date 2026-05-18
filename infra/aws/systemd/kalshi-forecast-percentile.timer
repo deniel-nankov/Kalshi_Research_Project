@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Kalshi forecast percentile capture daily
+
+[Timer]
+# Once a day at 06:30 UTC — well after the boot stampede window and
+# during low-activity hours. The endpoint updates slowly and doesn't
+# need fine cadence.
+OnCalendar=*-*-* 06:30:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+Unit=kalshi-forecast-percentile.service
+
+[Install]
+WantedBy=timers.target

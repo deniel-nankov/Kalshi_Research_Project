@@ -1,0 +1,20 @@
+[Unit]
+Description=Run Kalshi live-data capture every 2 minutes
+
+[Timer]
+# Stagger: milestones fires at +4 min, this fires at +8 min so it has a
+# fresh forward_milestones to read from.
+OnBootSec=8min
+# 2 min cadence is the floor given a ~2.5 min wall-clock per pass at
+# concurrency=8. Each pass overwrites no data (one parquet per run); a
+# missed cycle just means we have a 4-min sample-rate gap on play-by-play
+# until the next pass, which is fine for downstream detectors.
+OnUnitActiveSec=2min
+# Don't catch up missed slots — each pass is a "current snapshot," there's
+# no value in replaying stale snapshots of finished games.
+Persistent=false
+RandomizedDelaySec=15s
+Unit=kalshi-live-data.service
+
+[Install]
+WantedBy=timers.target
