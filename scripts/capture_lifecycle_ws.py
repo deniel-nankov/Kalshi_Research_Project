@@ -64,6 +64,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import websockets
 
+# Load .env so KALSHI_API_KEY_ID + KALSHI_API_PRIVATE_KEY are visible. Matches
+# the existing capture_ws_microstructure.py convention so a single .env in
+# the repo root covers all WS daemons.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 # Auth deps
 try:
     from cryptography.hazmat.primitives import hashes, serialization
@@ -161,21 +170,21 @@ def _write_audit_log(run_id: str, payload: dict[str, Any]) -> None:
 def _build_auth_headers() -> dict[str, str]:
     """
     Kalshi RSA-PSS auth: sign "<timestamp_ms>GET<path>" with the private key,
-    SHA-256, PSS padding, base64 the signature. Send as X-KALSHI-* headers.
+    SHA-256, PSS padding (salt_length=MAX_LENGTH to match capture_ws_microstructure),
+    base64 the signature. Send as KALSHI-ACCESS-* headers.
 
-    Env vars:
-      KALSHI_API_KEY_ID — UUID-like key id
-      KALSHI_API_PRIVATE_KEY_PEM — PEM-encoded private key (multiline string,
-                                   or path to file)
+    Env vars (matches the repo's .env convention):
+      KALSHI_API_KEY_ID      — UUID-like key id
+      KALSHI_API_PRIVATE_KEY — multiline PEM-encoded private key
+                                (or path to a .pem file)
     """
     if _CRYPTO_IMPORT_ERR:
         raise RuntimeError(f"cryptography import failed: {_CRYPTO_IMPORT_ERR!r}")
 
     key_id = os.environ.get("KALSHI_API_KEY_ID")
-    pem = os.environ.get("KALSHI_API_PRIVATE_KEY_PEM")
+    pem = os.environ.get("KALSHI_API_PRIVATE_KEY") or os.environ.get("KALSHI_API_PRIVATE_KEY_PEM")
     if not key_id or not pem:
-        # Public channels do NOT need auth, but if env is set we use it
-        return {}
+        raise RuntimeError("KALSHI_API_KEY_ID + KALSHI_API_PRIVATE_KEY must be set in env")
     if pem.startswith("/") and os.path.exists(pem):
         pem = Path(pem).read_text(encoding="utf-8")
     pkey = serialization.load_pem_private_key(pem.encode("utf-8"), password=None)
@@ -183,13 +192,13 @@ def _build_auth_headers() -> dict[str, str]:
     payload = f"{ts_ms}GET{WS_PATH}".encode("utf-8")
     sig = pkey.sign(
         payload,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
         hashes.SHA256(),
     )
     return {
         "KALSHI-ACCESS-KEY":       key_id,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("ascii"),
         "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("ascii"),
     }
 
 

@@ -65,7 +65,9 @@ AUDIT_DIR = STATE / "surveillance_runs"
 
 API_BASE = os.environ.get("KALSHI_API_BASE", "https://api.elections.kalshi.com/trade-api/v2")
 DEFAULT_PERCENTILES = [10, 25, 50, 75, 90]
-DEFAULT_PERIOD_INTERVAL = "hour"   # minute | hour | day per docs
+# Integer seconds per the live API contract — see _fetch_one quirks comment.
+PERIOD_INTERVAL_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
+DEFAULT_PERIOD_INTERVAL = "hour"
 DEFAULT_TIMEOUT_S = 25
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0
@@ -112,68 +114,100 @@ def _write_sha256_sidecar(parquet_path: Path) -> None:
 
 # -------------------- target enumeration --------------------
 
+_NUMERIC_STRIKE_TYPES = {"greater", "greater_or_equal", "less", "between", "structured"}
+
+
+def _derive_series_from_event(event_ticker: str) -> str:
+    """Kalshi event_ticker format is typically SERIES-EVENTSUFFIX (or just SERIES
+    for one-off events). The series ticker is the part before the first '-'.
+    """
+    if not event_ticker:
+        return ""
+    return str(event_ticker).split("-", 1)[0]
+
+
 def _list_target_events(series_filter: Optional[str], category_filter: Optional[str]) -> list[tuple[str, str]]:
     """
-    Read forward_markets to find (series_ticker, event_ticker) pairs that
-    appear to be numeric (heuristic: market_type contains scalar/numeric or
-    event ticker matches known numeric series patterns).
+    Read forward_markets to find (series_ticker, event_ticker) pairs whose
+    markets are NUMERIC — i.e. have a strike_type in {greater, greater_or_equal,
+    less, between, structured}. Those are the markets where Kalshi publishes a
+    percentile-based forecast distribution.
 
-    Returns deduped (series_ticker, event_ticker) pairs.
+    Note: Kalshi marks all markets with market_type='binary' regardless of
+    numeric shape, so strike_type is the right discriminator. The forward
+    markets parquet does NOT carry a `series_ticker` column, so we derive it
+    from `event_ticker` by taking the prefix before the first '-'.
     """
     files = sorted(glob.glob(str(MARKETS_DIR / "dt=*/*.parquet")))
     files = [f for f in files if not f.endswith(".tmp")]
     if not files:
         _log("WARN  no forward_markets parquets — cannot enumerate numeric events")
         return []
-    seen: set[tuple[str, str]] = set()
-    # Read minimal columns; project just the latest snapshot per event_ticker
+
+    # Look at recent files only (last 14 days) to reflect currently-active events
+    files = files[-50:]
+
+    seen: dict[tuple[str, str], int] = {}  # (series, event) -> count of numeric markets
     for fp in files:
+        cols_needed = ["event_ticker", "strike_type"]
+        if category_filter:
+            cols_needed.append("category")
         try:
-            tab = pq.read_table(fp, columns=["event_ticker", "series_ticker", "market_type", "category"]).to_pylist()
+            tab = pq.read_table(fp, columns=cols_needed).to_pylist()
         except Exception:
-            try:
-                tab = pq.read_table(fp, columns=["event_ticker", "series_ticker"]).to_pylist()
-            except Exception:
-                continue
+            continue
         for row in tab:
             ev = row.get("event_ticker")
-            sr = row.get("series_ticker")
-            if not ev or not sr:
+            if not ev:
                 continue
-            if series_filter and series_filter.upper() not in str(sr).upper():
+            strike = (row.get("strike_type") or "").lower()
+            if strike not in _NUMERIC_STRIKE_TYPES:
+                continue
+            sr = _derive_series_from_event(ev)
+            if series_filter and series_filter.upper() not in sr.upper():
                 continue
             if category_filter and str(row.get("category", "")).lower() != category_filter.lower():
                 continue
-            mt = (row.get("market_type") or "").lower()
-            # Heuristic: keep events whose market_type indicates a numeric / scalar shape
-            # (binary categorical markets don't have a percentile forecast). We also keep
-            # everything if --no-numeric-filter via env (and the API will return empty).
-            if mt and not any(k in mt for k in ("scalar", "numeric", "range", "value")):
-                continue
-            seen.add((sr, ev))
-    return sorted(seen)
+            seen[(sr, ev)] = seen.get((sr, ev), 0) + 1
+    return sorted(seen.keys())
 
 
 # -------------------- API fetch --------------------
 
 def _fetch_one(client: httpx.Client, series: str, event: str, percentiles: list[int],
-               start_ts: Optional[int], end_ts: Optional[int], period_interval: str) -> tuple[int, Optional[dict[str, Any]], Optional[str]]:
+               start_ts: Optional[int], end_ts: Optional[int], period_interval_seconds: int) -> tuple[int, Optional[dict[str, Any]], Optional[str]]:
+    """
+    Endpoint quirks (confirmed against live API May 2026):
+      - `percentiles` must be REPEATED query params (?percentiles=10&percentiles=25&…),
+        NOT comma-separated. Comma form errors with "strconv.ParseInt: parsing \"10,25,…\"".
+      - `start_ts` and `end_ts` are REQUIRED, not optional (docs don't say so).
+      - `period_interval` is an INTEGER in SECONDS (e.g. 60, 3600, 86400) — the
+        docs hint at strings ("minute"/"hour"/"day") but the API rejects strings.
+      - Some events return 400 "bad request" even with all params correct — this
+        appears to mean "this event has no forecast distribution published yet."
+        Treat 400 same as 404 (no data, not an error).
+
+    Note: this endpoint may require auth even though it's a "public" market
+    data endpoint. If 401, the caller must add KALSHI-ACCESS-* headers via
+    `_signed_headers()`.
+    """
     url = f"{API_BASE}/series/{series}/events/{event}/forecast_percentile_history"
-    params: dict[str, Any] = {"period_interval": period_interval}
-    # API accepts repeated `percentiles` parameter
-    params_multi = [("percentiles", str(p)) for p in percentiles]
-    if start_ts is not None:
-        params["start_ts"] = int(start_ts)
-    if end_ts is not None:
-        params["end_ts"] = int(end_ts)
+    # Build params as a list of tuples so percentiles is REPEATED
+    params: list[tuple[str, str]] = [("percentiles", str(p)) for p in percentiles]
+    params.append(("period_interval", str(int(period_interval_seconds))))
+    if start_ts is None:
+        # Default to last 7 days if caller didn't pin a window
+        start_ts = int(time.time()) - 7 * 86400
+    if end_ts is None:
+        end_ts = int(time.time())
+    params.append(("start_ts", str(int(start_ts))))
+    params.append(("end_ts",   str(int(end_ts))))
     last_err: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
-            # httpx supports list of tuples for repeated params via httpx.QueryParams
-            qp = httpx.QueryParams([*params.items(), *params_multi])
-            r = client.get(url, params=qp, timeout=DEFAULT_TIMEOUT_S)
-            if r.status_code == 404:
-                return 404, None, "not_found"
+            r = client.get(url, params=params, timeout=DEFAULT_TIMEOUT_S)
+            if r.status_code in (400, 404):
+                return r.status_code, None, "no_forecast_data"
             if r.status_code == 429:
                 time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
                 continue
@@ -320,7 +354,7 @@ def main() -> int:
     with httpx.Client(timeout=DEFAULT_TIMEOUT_S, limits=httpx.Limits(max_connections=args.concurrency)) as client:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
             futures = {
-                ex.submit(_fetch_one, client, sr, ev, percentiles, args.start_ts, args.end_ts, args.period_interval): (sr, ev)
+                ex.submit(_fetch_one, client, sr, ev, percentiles, args.start_ts, args.end_ts, PERIOD_INTERVAL_SECONDS.get(args.period_interval, 3600)): (sr, ev)
                 for sr, ev in targets
             }
             for fut in concurrent.futures.as_completed(futures):
@@ -336,7 +370,8 @@ def main() -> int:
                         n_ok += 1
                     else:
                         n_empty += 1
-                elif status == 404:
+                elif status in (400, 404):
+                    # 400 = "this event has no forecast distribution" (per probe). Treat same as 404.
                     n_404 += 1
                 else:
                     n_err += 1
