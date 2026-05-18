@@ -1,0 +1,27 @@
+[Unit]
+Description=Kalshi daily surveillance orchestrator (volume_burst_v2 alerts)
+After=network-online.target kalshi-forward.service
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/kalshi-pipeline
+# Targets yesterday UTC by default. Triggers forward.service if stale,
+# runs the 4 enrichment stages, applies v2 detector at edge=0.07
+# (max-Sharpe shipping threshold from M6.3 sweep), writes
+# surveillance/alerts/<dt>.jsonl + surveillance/reports/daily_<dt>.md.
+ExecStart=/opt/kalshi-pipeline/.venv/bin/python3 /opt/kalshi-pipeline/scripts/surveillance_daily.py
+# 90 min cap: enrich (~3 min) + milestones/pbp/lifecycle (~10 sec each) +
+# detect (~5 sec) + headroom for a forward catch-up that runs first.
+TimeoutStartSec=5400
+Nice=10
+MemoryMax=8G
+Restart=on-failure
+RestartSec=600
+
+[Install]
+WantedBy=multi-user.target

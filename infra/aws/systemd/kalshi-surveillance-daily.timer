@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Kalshi daily surveillance pipeline at 04:30 UTC
+
+[Timer]
+# 04:30 UTC = midnight ET — after most US markets have settled, so the
+# previous-day enrichment has complete outcomes to label.
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=kalshi-surveillance-daily.service
+
+[Install]
+WantedBy=timers.target
