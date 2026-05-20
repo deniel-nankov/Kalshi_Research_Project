@@ -116,7 +116,7 @@ OUT_DIR = DERIVED / "price_impact"
 REPORTS_DIR = PROJECT_ROOT / "surveillance" / "reports"
 AUDIT_DIR = STATE / "price_impact_runs"
 
-VERSION = "analyze_price_impact@1.3.0"
+VERSION = "analyze_price_impact@1.3.1"
 
 WINDOW_SIZES = [1, 5, 10, 25, 50, 100]
 
@@ -791,24 +791,35 @@ def process_shard(
     }
 
     if save_trade_level:
-        df_out = df.with_columns(
-            pl.col("created_time").dt.strftime("%Y-%m-%d").alias("dt")
-        )
+        # Keep only YES-FRAME window columns in the parquet.  Taker-aligned
+        # variants are derivable downstream by consumers as
+        #   avg_taker_pre_N = avg_yes_pre_N           if taker_side == 'yes'
+        #                    1.0 - avg_yes_pre_N      otherwise
+        # so we avoid materializing them per row at write time (memory
+        # budget) and also halve the parquet column count.
         keep = [
             "trade_id", "market_ticker", "created_time", "taker_side",
             "yes_price_dollars", "no_price_dollars", "taker_price_dollars",
             "count", "notional_usd", "was_taker_correct",
-            "prev_yes_price_dollars", "prev_taker_price_aligned",
+            "prev_yes_price_dollars", "prev_no_price_dollars",
+            "prev_taker_price_aligned",
             "price_impact_yes_cents", "price_impact_taker_cents",
             "abs_price_impact_yes_cents",
         ]
         for N in WINDOW_SIZES:
-            keep.extend([
-                f"avg_yes_pre_{N}", f"avg_yes_post_{N}",
-                f"avg_taker_pre_{N}", f"avg_taker_post_{N}",
-            ])
-        df_out = df_out.select(keep + ["dt"])
-        for dt_val in df_out.select(pl.col("dt").unique()).to_series():
+            keep.extend([f"avg_yes_pre_{N}", f"avg_yes_post_{N}"])
+        df_out = df.select(keep + [
+            pl.col("created_time").dt.strftime("%Y-%m-%d").alias("dt"),
+        ])
+
+        # Free the original feature-laden df before the per-day write loop.
+        del df, df_with_side, df_resolved, df_resolved_with_side
+        gc.collect()
+
+        unique_dts = (
+            df_out.select(pl.col("dt").unique().sort()).to_series().to_list()
+        )
+        for dt_val in unique_dts:
             sub = df_out.filter(pl.col("dt") == dt_val).drop("dt")
             out_dir = OUT_DIR / f"dt={dt_val}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -817,9 +828,12 @@ def process_shard(
             sub.write_parquet(tmp, compression="zstd")
             os.replace(tmp, out_path)
             _write_sha256_sidecar(out_path)
-
-    del df, df_with_side, df_resolved, df_resolved_with_side
-    gc.collect()
+            del sub
+        del df_out
+        gc.collect()
+    else:
+        del df, df_with_side, df_resolved, df_resolved_with_side
+        gc.collect()
     return partials, n_rows, n_resolved
 
 
@@ -830,10 +844,17 @@ def main(argv=None) -> int:
     ap.add_argument("--days", type=int, default=None)
     ap.add_argument("--from-dt", type=str, default=None)
     ap.add_argument("--to-dt", type=str, default=None)
-    ap.add_argument("--shards", type=int, default=8, help="Market-hash shards. Use 1 for small workloads (no sharding).")
+    ap.add_argument("--shards", type=int, default=None,
+                    help="Market-hash shards. Default: 8 (16 when --save-trade-level). Use 1 for small workloads.")
     ap.add_argument("--save-trade-level", action="store_true",
                     help="Also write per-day per-trade parquets under data/kalshi/derived/price_impact/")
     args = ap.parse_args(argv)
+
+    # Memory-safe default sharding.  --save-trade-level keeps the full
+    # feature-laden DataFrame resident during the per-day write loop, so we
+    # halve per-shard footprint by default.
+    if args.shards is None:
+        args.shards = 16 if args.save_trade_level else 8
 
     started_at = time.time()
     started_dt = datetime.now(timezone.utc)
@@ -863,13 +884,19 @@ def main(argv=None) -> int:
 
     for shard_id in range(n_shards):
         t0 = time.time()
-        partials, n_rows, n_resolved = process_shard(
-            glob_paths=glob_paths,
-            shard_id=shard_id,
-            n_shards=n_shards,
-            save_trade_level=args.save_trade_level,
-            run_id=run_id,
-        )
+        try:
+            partials, n_rows, n_resolved = process_shard(
+                glob_paths=glob_paths,
+                shard_id=shard_id,
+                n_shards=n_shards,
+                save_trade_level=args.save_trade_level,
+                run_id=run_id,
+            )
+        except Exception as e:
+            import traceback
+            _log(f"ERROR shard {shard_id+1}/{n_shards}: {type(e).__name__}: {e}")
+            _log(traceback.format_exc())
+            raise
         for k, v in partials.items():
             if v.height > 0:
                 partials_by_scenario[k].append(v)
